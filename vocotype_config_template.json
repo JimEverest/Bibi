@@ -1,0 +1,34 @@
+{
+  "hotkeys": {
+    "toggle": "f2",
+    "push_to_talk": "win+ctrl+alt"
+  },
+  "ui": {
+    "show_indicator": true
+  },
+  "output": {
+    "method": "auto",
+    "append_newline": false
+  },
+  "audio": {
+    "gain": 12.0,
+    "max_session_bytes": 1984000,
+    "save_recordings": false
+  },
+  "llm": {
+    "enabled": true,
+    "schema": "openai",
+    "style": "chat",
+    "endpoint": "https://api.deepseek.com/v1/chat/completions",
+    "api_key": "sk-xxxxxxxxxx",
+    "model": "deepseek-v4-flash",
+    "temperature": 0.3,
+    "timeout_seconds": 15.0,
+    "disable_thinking": true,
+    "vocabulary": "线程, 跨线程, 队列, 主线程, 事件泵, 派发, 回调, 音频采集, 采样率, 转录, 润色, 词典, 增益, 热键, 托盘, 浮窗, ModelScope, FunASR, SenseVoice, ONNX, Python, Node.js",
+    "prompt": "",
+    "http_proxy": "",
+    "https_proxy": "",
+    "disable_ssl_verify": true
+  }
+}
