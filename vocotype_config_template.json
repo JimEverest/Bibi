@@ -1,7 +1,7 @@
 {
   "hotkeys": {
     "toggle": "f2",
-    "push_to_talk": "win+ctrl+alt"
+    "push_to_talk": "win+ctrl"
   },
   "ui": {
     "show_indicator": true
@@ -20,13 +20,14 @@
     "schema": "openai",
     "style": "chat",
     "endpoint": "https://api.deepseek.com/v1/chat/completions",
-    "api_key": "sk-xxxxxxxxxx",
+    "api_key": "sk-xxxxxxxxxxxxxx",
     "model": "deepseek-v4-flash",
+    "max_tokens": 512,
     "temperature": 0.3,
     "timeout_seconds": 15.0,
     "disable_thinking": true,
     "vocabulary": "线程, 跨线程, 队列, 主线程, 事件泵, 派发, 回调, 音频采集, 采样率, 转录, 润色, 词典, 增益, 热键, 托盘, 浮窗, ModelScope, FunASR, SenseVoice, ONNX, Python, Node.js",
-    "prompt": "",
+    "prompt": "你是语音识别文本校对助手。只做最小必要修改：纠正明确的同音错字、ASR误识别和标点；保留原意、语气、语言和句式；不确定时保持原样。只返回校对后的文本，不要解释。\\n\\n{VOCAB}原始文本：\\n{TEXT}",
     "http_proxy": "",
     "https_proxy": "",
     "disable_ssl_verify": true

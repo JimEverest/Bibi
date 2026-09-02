@@ -1,18 +1,37 @@
+# Bibi 依赖清单
+#
+# !! 安装顺序（两步，绕开 funasr_onnx 的过时 numpy 元数据限制）!!
+#   pip install --no-deps funasr_onnx==0.4.1
+#   pip install -r requirements.txt
+#
+# 原因：funasr_onnx 0.4.1 元数据声明 numpy<=1.26.4，但 numpy 1.26.4 在
+# Python 3.13 无预编译 wheel（源码编译需 C++ Build Tools，内网机不可行）。
+# 实测 funasr_onnx 在 numpy 2.1.3 下运行正常（开发机同组合已验证），
+# 其元数据只是过时的保守声明，用 --no-deps 绕过即可。
+
 sounddevice==0.5.2
 keyboard==0.13.5
 pyperclip==1.11.0
 librosa==0.11.0
 soundfile==0.13.1
-funasr_onnx==0.4.1
 jieba==0.42.1
+torch
+# ---- funasr_onnx 的实际依赖（显式列出，代替其过时元数据）----
+numpy==2.1.3
+onnxruntime==1.29.0
+onnx==1.22.0
+ml_dtypes>=0.5.4
+kaldi_native_fbank==1.22.3
+sentencepiece==0.2.2
+PyYAML>=5.1.2
+
+# ---- librosa 依赖链锁定（防止 pip 回退到无 cp313 wheel 的旧版源码包）----
+numba==0.67.0
+llvmlite==0.49.0
+scipy==1.18.1
 
 # Volcengine BigASR 流式识别（backend == "volcengine" 时需要）
 websockets>=12.0
 
-# Optional backends for model downloading (recommended)
-# 选其一或都装：用于 AutoModel 拉取/缓存模型
+# 模型下载（首次运行拉取/缓存模型）
 modelscope==1.30.0
-
-# 说明：
-# - 切换为 ONNX 路线（onnxruntime）；如需 GPU/PyTorch，请安装 torch(+cu) 与 torchaudio。
-
