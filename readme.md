@@ -106,6 +106,68 @@ python main.py
 
 所有热键均可在设置界面修改，重启程序生效。
 
+## 模型说明
+
+### 各功能模块与所用模型
+
+| 功能模块 | 引擎/服务 | 模型 | 说明 |
+|---|---|---|---|
+| 语音识别（核心） | 本地离线 FunASR-ONNX | `iic/SenseVoiceSmall`（默认） | 中英混合识别，自带标点与 ITN，自动剥离情绪标签 |
+| 语音识别（回退） | 本地离线 FunASR-ONNX | `iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-onnx` | 旧引擎，中文为主；名字带 "large" 是架构代号，**不是**新引擎 |
+| 端点检测 VAD | 本地离线 FunASR-ONNX | `iic/speech_fsmn_vad_zh-cn-16k-common-onnx` | 仅 534KB；按 `asr.use_vad` 开关加载（默认关） |
+| 标点恢复 | 本地离线 FunASR-ONNX | `iic/punc_ct-transformer_zh-cn-common-vocab272727-onnx` | 仅 paraformer 引擎需要（SenseVoice 自带标点） |
+| 云端识别（可选） | 火山引擎 BigASR 流式 | 云端大模型，无需下载 | `backend: "volcengine"` 时启用，需 App Key/Access Key；音频会上传 |
+| LLM 润色（可选） | 外部 LLM API | 任意 OpenAI/Anthropic 兼容模型 | 已实测 DeepSeek（`deepseek-v4-flash`）双协议；建议关闭 thinking 提速 |
+| 文本注入 / 热键 / 词典 / 托盘 | — | 无模型 | 纯本地逻辑 |
+
+### 本地模型存放位置
+
+模型存放于 ModelScope 标准缓存目录（程序按此路径查找，**目录结构不可变**）：
+
+```
+%USERPROFILE%\.cache\modelscope\hub\models\iic\
+├── SenseVoiceSmall\                                          # 默认引擎，必需（约 232MB，用量化版 model_quant.onnx）
+│   ├── model_quant.onnx          # 量化识别模型
+│   ├── chn_jpn_yue_eng_ko_spectok.bpe.model
+│   ├── am.mvn
+│   └── config.yaml
+├── speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-onnx\   # 可选回退（228MB）
+├── speech_fsmn_vad_zh-cn-16k-common-onnx\                    # 可选 VAD（534KB）
+└── punc_ct-transformer_zh-cn-common-vocab272727-onnx\        # 可选标点（274MB，仅 paraformer 用）
+```
+
+**下载方式**（二选一）：
+- **自动**：联网环境下首次运行 `python main.py`，程序自动从 ModelScope 下载（约 500MB，含全部模型）
+- **手动**：`python -c "from app.download_models import main; main()"` 或从 ModelScope 页面直接下载后放入上述目录：
+  - https://modelscope.cn/models/iic/SenseVoiceSmall
+  - https://modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-onnx
+  - https://modelscope.cn/models/iic/speech_fsmn_vad_zh-cn-16k-common-onnx
+  - https://modelscope.cn/models/iic/punc_ct-transformer_zh-cn-common-vocab272727-onnx
+
+**最省方案**：只放 `SenseVoiceSmall\`（232MB）即可跑默认引擎。离线内网部署请直接用 `vocotype_offline_bundle/`（已内置全部模型），详见 `内网部署手册.md`。
+
+### 引擎切换
+
+环境变量 `ASR_ENGINE` 控制（`启动语音输入.bat` 已默认设置）：
+
+```bat
+set ASR_ENGINE=sensevoice   :: 默认，中英混说更准
+set ASR_ENGINE=paraformer   :: 回退，中文为主，支持热词（需另配标点模型）
+```
+
+> 别被名字迷惑：**Paraformer-"large" 是旧引擎**；新默认引擎的模型反而叫 **SenseVoice-"Small"**——"large/small" 是架构代号，不代表效果。
+
+### 实测结论与其他模型方案
+
+| 方案 | 结论 |
+|---|---|
+| **SenseVoiceSmall**（当前默认） | ✅ 实测最优：中英混说显著优于 Paraformer，英文长句几乎全对；加载 2.6s、13s 音频推理约 1s |
+| Paraformer-large（ONNX） | 旧默认，中文准但英文弱（长句碎成单词）；保留作回退 |
+| SenseVoiceSmall FP32（model.onnx） | 未采用：比量化版大且速度无优势，量化版精度损失可忽略 |
+| FunASR 在线/流式模型 | 未采用：本工具为"说完一句转一句"的非流式场景，非流式模型更准 |
+| whisper.cpp / faster-whisper | 备选未用：英文强但中文场景体积/速度/易用性不如 SenseVoice；且 CPU 上 small 以上模型偏慢 |
+| 火山引擎 BigASR（云端） | 已接入可选：识别质量旗舰级、无需下载模型，但需联网且音频出本机（隐私敏感场景不适用） |
+
 ## 目录结构
 
 ```
@@ -116,8 +178,11 @@ bibi/
 ├── vocotype_config.json     # 配置文件（启动自动加载）
 ├── app/
 │   ├── appinfo.py           # 应用名称与版本号（唯一出处）
-│   ├── asr.py               # FunASR/SenseVoice ONNX 推理封装
-│   ├── audio.py             # 麦克风采集与增益
+│   ├── funasr_server.py     # FunASR 模型服务器（模型常驻内存，stdin/stdout 通信）
+│   ├── funasr_config.py     # 模型名称/版本/引擎统一配置
+│   ├── download_models.py   # 模型下载（ModelScope snapshot_download）
+│   ├── volcengine_asr.py    # 火山引擎云端流式识别后端（可选）
+│   ├── audio_capture.py     # 麦克风采集与增益
 │   ├── transcribe.py        # 转写编排（录音→ASR→词典→LLM→注入）
 │   ├── llm_polish.py        # LLM 润色（OpenAI/Anthropic 双协议）
 │   ├── dictionary.py        # 词典替换 + 词汇提示
@@ -129,7 +194,7 @@ bibi/
 │   ├── singleton.py         # 单实例端口锁
 │   ├── typer.py             # 文本注入（SendInput/剪贴板/Unicode）
 │   └── config.py            # 配置加载与默认值
-└── models/                  # 本地模型文件（首次运行自动下载）
+└── models/                  # 本地模型文件（首次运行自动下载，或见「模型说明」一节）
 ```
 
 ## 常见问题
