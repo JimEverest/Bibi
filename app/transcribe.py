@@ -517,6 +517,43 @@ class TranscriptionWorker:
             except Exception as exc:  # noqa: BLE001
                 logger.error("处理转写结果时出错: %s", exc)
 
+    def force_reset(self) -> None:
+        """强制停止/恢复：录音或流式预览进入无法恢复的异常状态时的最后手段。
+
+        绝不抛出异常；每一步都独立捕获并记录，尽力清理状态，
+        使后续的 start() 能重新正常工作。
+        """
+        try:
+            self.audio.stop()
+        except Exception as exc:
+            logger.error("强制停止：停止音频采集时出错: %s", exc)
+
+        if getattr(self, "_streaming_session", None) is not None:
+            try:
+                self._streaming_session.finish()
+            except RuntimeError as exc:
+                logger.error("强制停止：流式会话已处于关闭状态: %s", exc)
+            except Exception as exc:
+                logger.error("强制停止：结束流式预览会话时出错: %s", exc)
+
+        try:
+            with self._state_lock:
+                self._running.clear()
+                self._recording.clear()
+                self._stop_requested.clear()
+                self._capture_thread = None
+                self._current_session_id = None
+        except Exception as exc:
+            logger.error("强制停止：重置工作状态标志时出错: %s", exc)
+
+        try:
+            with self._buffer_lock:
+                self._buffer.clear()
+        except Exception as exc:
+            logger.error("强制停止：清空音频缓冲区时出错: %s", exc)
+
+        logger.warning("强制停止已执行：清理录音/流式预览状态")
+
     @property
     def is_running(self) -> bool:
         return self._running.is_set()

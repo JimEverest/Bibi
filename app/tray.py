@@ -50,6 +50,7 @@ class TrayApp:
         llm_config_path: str,
         log_dir: str,
         llm_enabled_callback: Callable[[bool], None] | None = None,
+        force_stop_callback: Callable[[], None] | None = None,
     ):
         """
         toggle_callback: 线程安全的 F2 等效操作（切录音）
@@ -66,11 +67,14 @@ class TrayApp:
         self._icon = None
         self._llm_enabled_lock = threading.RLock()
         self._llm_enabled_callback = llm_enabled_callback
+        self._force_stop_callback = force_stop_callback
         self._llm_enabled = self._read_llm_enabled()
         self._poll_thread: threading.Thread | None = None
 
         menu = pystray.Menu(
             pystray.MenuItem("开始/停止录音（托盘）", self._on_toggle, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("强制停止", self._on_force_stop),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 lambda item: "LLM 润色：开" if self._is_llm_enabled() else "LLM 润色：关",
@@ -131,6 +135,14 @@ class TrayApp:
         except Exception as exc:  # noqa: BLE001
             logger.error("托盘触发录音切换失败: %s", exc)
 
+    def _on_force_stop(self, icon, item):
+        if self._force_stop_callback is None:
+            return
+        try:
+            self._force_stop_callback()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("强制停止触发失败: %s", exc)
+
     def _on_toggle_llm(self, icon, item):
         try:
             import json
@@ -181,6 +193,11 @@ class TrayApp:
         menu.add_command(
             label="开始/停止录音（托盘）",
             command=lambda: self._on_toggle(None, None),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="强制停止",
+            command=lambda: self._on_force_stop(None, None),
         )
         menu.add_separator()
         menu.add_command(

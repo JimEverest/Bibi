@@ -164,6 +164,19 @@ def main() -> None:
         if floating_button is not None:
             floating_button.show_processing()
 
+    def _force_stop() -> None:
+        logger.warning("用户触发强制停止")
+        try:
+            worker.force_reset()
+        except Exception as exc:
+            logger.error("强制停止执行失败: %s", exc)
+        if floating_button is not None:
+            try:
+                floating_button.clear_preview()
+                floating_button.show_idle()
+            except Exception as exc:
+                logger.error("强制停止后重置悬浮按钮失败: %s", exc)
+
     if not args.once:
         from app.floating_button import FloatingButton
 
@@ -262,6 +275,7 @@ def main() -> None:
                 llm_config_path=config_path,
                 log_dir=log_dir_abs,
                 llm_enabled_callback=_set_llm_enabled,
+                force_stop_callback=_force_stop,
             )
             _TRAY_APP["instance"] = tray_app
             if floating_button is not None:
