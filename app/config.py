@@ -105,6 +105,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "segment_silence_ms": 450,
         "commit_silence_ms": 1200,
         "max_uncommitted_ms": 12000,
+        # Onset-smoothing pad kept in the uncommitted buffer after a commit
+        # (not a text-splice overlap): gives the next segment a little
+        # audio-only context so ASR doesn't start "cold".
         "audio_overlap_ms": 150,
         "preview_context_chars": 30,
         "preview_max_chars": 120,

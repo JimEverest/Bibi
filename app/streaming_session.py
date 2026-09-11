@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Literal
+import logging
 import threading
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -59,7 +63,7 @@ class PreviewAssembler:
 class SegmentTask:
     sequence: int
     samples: np.ndarray
-    kind: str = "preview"
+    kind: Literal["preview", "commit"] = "preview"
 
 
 class StreamingSegmenter:
@@ -172,6 +176,13 @@ class StreamingSession:
         self._transcribe_segment = transcribe_segment
         self._polish_tail = polish_tail
         self._on_preview = on_preview
+        # Guards the *identity* of `self._segmenter`/`self._asr_pool`/
+        # `self._llm_pool` (and `self._closed`): serializes push_chunk/finish
+        # segmenter access + task submission against start()'s swap-in of
+        # brand-new objects for a new recording. It does NOT protect
+        # `self._preview` state -- that's `self._preview_lock`'s job, since
+        # preview mutation happens from the ASR/LLM worker threads and is an
+        # unrelated concern. Do not nest acquisitions of this lock.
         self._lock = threading.Lock()
         self._preview_lock = threading.Lock()
         self._closed = True
@@ -206,35 +217,51 @@ class StreamingSession:
             self._closed = False
 
     def push_chunk(self, samples: np.ndarray) -> None:
+        is_speech = self._detect_speech(samples, is_final=False)
         with self._lock:
             if self._closed:
                 return
-        is_speech = self._detect_speech(samples, is_final=False)
-        for task in self._segmenter.push_chunk(samples, is_speech=is_speech, is_final=False):
-            self._asr_pool.submit(self._run_asr_task, task)
+            for task in self._segmenter.push_chunk(samples, is_speech=is_speech, is_final=False):
+                self._asr_pool.submit(self._run_asr_task, task)
 
     def finish(self) -> None:
         with self._lock:
             self._closed = True
-        dummy = np.zeros(0, dtype=np.int16)
-        for task in self._segmenter.push_chunk(dummy, is_speech=False, is_final=True):
-            self._asr_pool.submit(self._run_asr_task, task)
-        self._asr_pool.shutdown(wait=True)
-        self._llm_pool.shutdown(wait=True)
+            dummy = np.zeros(0, dtype=np.int16)
+            for task in self._segmenter.push_chunk(dummy, is_speech=False, is_final=True):
+                self._asr_pool.submit(self._run_asr_task, task)
+            asr_pool = self._asr_pool
+            llm_pool = self._llm_pool
+        # Shutdown can block for a while waiting on in-flight ASR/LLM work;
+        # don't hold `_lock` here since it doesn't touch shared segmenter
+        # state and would otherwise block a concurrent start() unnecessarily.
+        asr_pool.shutdown(wait=True)
+        llm_pool.shutdown(wait=True)
+
+    def _promote_and_notify(self) -> None:
+        with self._preview_lock:
+            snap = self._preview.promote_tail()
+            self._on_preview(snap.committed, snap.tail, "recording")
 
     def _run_asr_task(self, task: SegmentTask) -> None:
         result = self._transcribe_segment(task.samples)
         if not result.get("success"):
+            if task.kind == "commit":
+                logger.warning(
+                    "ASR failed for commit segment (sequence=%s); audio already "
+                    "cleared from buffer, transcript is lost",
+                    task.sequence,
+                )
             return
         is_commit = task.kind == "commit"
         prefix_context = None
         with self._preview_lock:
             snap = self._preview.apply_asr_segment(task.sequence, result.get("text", ""))
             self._on_preview(snap.committed, snap.tail, "recording")
-            if self._polish_tail is not None and snap.tail:
+            should_polish = self._polish_tail is not None and bool(snap.tail)
+            if should_polish:
                 prefix_context = self._preview.context_prefix()
 
-        should_polish = self._polish_tail is not None and bool(snap.tail)
         if should_polish:
             self._llm_pool.submit(
                 self._run_llm_task,
@@ -247,9 +274,7 @@ class StreamingSession:
             # No LLM polishing configured (or nothing to polish): the commit
             # is authoritative on its own, so promote it into `committed`
             # immediately instead of leaving it stranded in `tail` forever.
-            with self._preview_lock:
-                snap2 = self._preview.promote_tail()
-                self._on_preview(snap2.committed, snap2.tail, "recording")
+            self._promote_and_notify()
 
     def _run_llm_task(self, sequence: int, prefix_context: str, tail_text: str, is_commit: bool = False) -> None:
         def _on_update(partial: str) -> None:
@@ -267,6 +292,4 @@ class StreamingSession:
             # The polished (or best-effort) text for this segment is now
             # final: promote it into `committed` and revert state back to
             # "recording" so the UI doesn't sit in "processing" forever.
-            with self._preview_lock:
-                snap = self._preview.promote_tail()
-                self._on_preview(snap.committed, snap.tail, "recording")
+            self._promote_and_notify()

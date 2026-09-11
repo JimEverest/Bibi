@@ -276,6 +276,25 @@ class StreamingSessionTests(unittest.TestCase):
         self.assertEqual(committed_events[-1][0], "已提交文本")
 
 
+    def test_asr_failure_on_commit_logs_warning_and_does_not_crash(self):
+        events = []
+        session = StreamingSession(
+            sample_rate=16000,
+            streaming_cfg=self._streaming_cfg(),
+            detect_speech=lambda samples, is_final=False: bool(samples.max()),
+            transcribe_segment=lambda samples: {"success": False},
+            on_preview=lambda committed, tail, state: events.append((committed, tail, state)),
+        )
+        session.start()
+        with self.assertLogs("app.streaming_session", level="WARNING") as cm:
+            session.push_chunk(np.ones(1600, dtype=np.int16))
+            session.finish()
+
+        self.assertTrue(any("commit" in msg for msg in cm.output))
+        # No promotion into committed should have happened.
+        self.assertFalse(any(e[0] for e in events))
+
+
 class StreamingSessionLLMTests(unittest.TestCase):
     def _streaming_cfg(self, **overrides):
         cfg = {
