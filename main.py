@@ -184,6 +184,67 @@ def main() -> None:
     if args.save_dataset:
         worker.on_result = wrap_result_handler(worker.on_result, worker, args.dataset_dir)
 
+    # 流式预览（伪流式）：仅在启用悬浮胶囊、非 --once 单次模式、FunASR 后端且配置开启时接入
+    from app.dictionary import TermReplacer
+    from app.streaming_session import StreamingSession
+    from app.funasr_server import FunASRServer, build_streaming_speech_detector
+
+    replacer = TermReplacer()
+
+    def _stream_transcribe_segment(streaming_fun_server):
+        def _transcribe(samples):
+            result = streaming_fun_server.transcribe_samples(
+                samples,
+                sample_rate=config["audio"]["sample_rate"],
+                options=config.get("asr"),
+            )
+            if not result.get("success"):
+                return {"success": False, "text": ""}
+            result["text"] = replacer.replace(result.get("text", ""))
+            return result
+
+        return _transcribe
+
+    def _stream_polish_tail(prefix_context, tail_text, on_update):
+        polisher = _LLM_POLISHER["instance"]
+        if polisher is None or not polisher.is_enabled():
+            return None
+        return polisher.polish_tail_stream(
+            prefix_context,
+            tail_text,
+            extra_vocab=replacer.vocab_hints(),
+            on_update=on_update,
+        )
+
+    streaming_cfg = config.get("streaming", {})
+    if (
+        not args.once
+        and floating_button is not None
+        and config.get("backend", "funasr").lower() == "funasr"
+        and streaming_cfg.get("enabled", True)
+    ):
+        if streaming_cfg.get("dedicated_model_instance", False):
+            streaming_fun_server = FunASRServer()
+        else:
+            streaming_fun_server = worker.fun_server
+
+        streaming_session = StreamingSession(
+            sample_rate=config["audio"]["sample_rate"],
+            streaming_cfg=streaming_cfg,
+            detect_speech=build_streaming_speech_detector(
+                config.get("vad", {}),
+                config["audio"]["sample_rate"],
+            ),
+            transcribe_segment=_stream_transcribe_segment(streaming_fun_server),
+            polish_tail=_stream_polish_tail,
+            on_preview=lambda committed, tail, state: floating_button.show_preview(
+                committed,
+                tail,
+                state=state,
+            ),
+        )
+        worker.attach_streaming_session(streaming_session)
+
     hotkeys = HotkeyManager()
     _register_configured_hotkeys(hotkeys, config, worker)
 
@@ -315,6 +376,7 @@ def _make_result_handler(
             if floating_button is None:
                 indicator.hide()
             else:
+                floating_button.clear_preview()
                 floating_button.show_idle()
         except Exception:
             pass

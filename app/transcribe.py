@@ -94,7 +94,8 @@ class TranscriptionWorker:
             self._max_session_bytes = 20 * 1024 * 1024
             logger.warning("max_session_bytes 配置非法，已回退至 20MB")
         self._session_bytes: int = 0
-        
+        self._streaming_session = None
+
         # 异步转录队列和工作线程
         self._transcription_queue: "queue.Queue[Optional[np.ndarray]]" = queue.Queue(maxsize=10)
         self._transcription_thread: Optional[threading.Thread] = None
@@ -104,6 +105,10 @@ class TranscriptionWorker:
         
         # 启动转录工作线程
         self._start_transcription_worker()
+
+    def attach_streaming_session(self, session) -> None:
+        """挂载流式预览会话（StreamingSession），录音时同步分发音频块用于分段预览识别。"""
+        self._streaming_session = session
 
     def __del__(self) -> None:
         """析构函数，确保资源被清理"""
@@ -243,6 +248,8 @@ class TranscriptionWorker:
                 self._buffer.clear()
                 self._session_bytes = 0
             self.audio.start()
+            if self._streaming_session is not None:
+                self._streaming_session.start()
             self._recording.set()
             self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
             self._capture_thread.start()
@@ -274,7 +281,9 @@ class TranscriptionWorker:
         
         # 第二阶段：在锁外执行耗时操作
         self.audio.stop()
-        
+        if self._streaming_session is not None:
+            self._streaming_session.finish()
+
         # 只有从外部调用时才join capture线程，避免自己join自己
         # 使用保存的线程引用，而不是self._capture_thread
         if not _from_capture_thread:
@@ -331,6 +340,9 @@ class TranscriptionWorker:
                         arr = self._apply_gain(arr)
                     self._buffer.append(arr)
                     self._session_bytes += arr.nbytes
+                # 流式预览：在缓冲区锁外分发一份拷贝，避免 ASR 提交阻塞录音采集
+                if self._streaming_session is not None:
+                    self._streaming_session.push_chunk(arr.copy())
             except Exception as exc:
                 logger.error("处理音频帧时出错: %s", exc)
 
