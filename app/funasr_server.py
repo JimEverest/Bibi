@@ -15,6 +15,8 @@ import sys
 import warnings
 import time
 
+import numpy as np
+
 # 过滤掉 jieba 的 pkg_resources 弃用警告
 warnings.filterwarnings("ignore", category=UserWarning, module="jieba._compat")
 
@@ -29,6 +31,39 @@ from app.logging_config import setup_logging
 
 
 logger = logging.getLogger(__name__)
+
+
+def build_streaming_speech_detector(vad_cfg: dict, sample_rate: int):
+    """构建基于能量阈值的流式语音活动检测器。
+
+    `Fsmn_vad_online` 返回的是边界事件而非逐帧语音标志，因此这里使用有状态的
+    RMS 能量阈值检测器，由现有（此前未使用的）`vad.*` 配置项驱动。
+    """
+    start_threshold = float(vad_cfg.get("start_threshold", 0.02))
+    stop_threshold = float(vad_cfg.get("stop_threshold", 0.01))
+    min_speech_ms = float(vad_cfg.get("min_speech_ms", 300))
+    min_silence_ms = float(vad_cfg.get("min_silence_ms", 200))
+
+    state = {"active": False, "speech_ms": 0.0, "silence_ms": 0.0}
+
+    def detect(samples: np.ndarray, is_final: bool = False) -> bool:
+        if samples.size == 0:
+            return state["active"]
+        rms = float(np.sqrt(np.mean((samples.astype("float32") / 32768.0) ** 2)))
+        chunk_ms = samples.size / sample_rate * 1000.0
+        if rms >= start_threshold:
+            state["speech_ms"] += chunk_ms
+            state["silence_ms"] = 0.0
+            if state["speech_ms"] >= min_speech_ms:
+                state["active"] = True
+        elif rms <= stop_threshold:
+            state["silence_ms"] += chunk_ms
+            state["speech_ms"] = 0.0
+            if state["silence_ms"] >= min_silence_ms:
+                state["active"] = False
+        return state["active"]
+
+    return detect
 
 
 class FunASRServer:
@@ -581,6 +616,26 @@ class FunASRServer:
             logger.error(error_msg)
             logger.error(traceback.format_exc())
             return {"success": False, "error": error_msg, "type": "transcription_error"}
+
+    def transcribe_samples(self, samples, sample_rate: int, options=None):
+        """转录内存中的音频采样（用于流式分段识别），内部落地为临时 WAV 文件后复用 transcribe_audio"""
+        import tempfile
+        import wave
+
+        fd, path = tempfile.mkstemp(prefix="stream_segment_", suffix=".wav")
+        os.close(fd)
+        try:
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(samples.astype("int16").tobytes())
+            return self.transcribe_audio(path, options=options)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def _contains_cjk(self, text: str) -> bool:
         """检查文本是否包含中日韩字符（SenseVoice 英文输出无需中文标点恢复）"""
