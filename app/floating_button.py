@@ -18,7 +18,20 @@ _MUTED = "#8a94ad"
 _BAR_BG = "#0473ea"
 _EXPANDED_SIZE = (176, 54)
 _COLLAPSED_SIZE = (68, 16)
+_PREVIEW_SIZE = (280, 78)
 _DRAG_THRESHOLD = 3
+
+
+def render_preview_text(committed: str, tail: str, max_chars: int = 120) -> str:
+    """Render a single-line preview, truncating from the left so the newest tail stays visible."""
+    text = f"{committed}{tail}"
+    if len(text) <= max_chars:
+        return text
+    ellipsis = "…"
+    keep = max_chars - len(ellipsis)
+    if keep <= 0:
+        return ellipsis[:max_chars]
+    return ellipsis + text[-keep:]
 
 
 class FloatingButtonDragController:
@@ -88,8 +101,11 @@ class FloatingButton:
         self._main_area = None
         self._main_label = None
         self._toggle_button = None
+        self._preview_label = None
         self._state = "idle"
         self._collapsed = False
+        self._preview_text = ""
+        self._preview_max_chars = 120
         self._drag_controller = FloatingButtonDragController()
         self._context_menu_callback = None
         self._lock = threading.Lock()
@@ -163,6 +179,18 @@ class FloatingButton:
                 )
                 toggle.pack(side="left", fill="y", padx=(0, 2))
 
+                preview = tk.Label(
+                    root,
+                    text="",
+                    bg=_BG,
+                    fg=_MUTED,
+                    font=("Segoe UI", 9),
+                    anchor="w",
+                    padx=12,
+                    pady=4,
+                )
+                # Not packed here on purpose — only shown when there is preview text.
+
                 for widget in (main, label):
                     widget.bind("<ButtonPress-1>", self._on_main_press)
                     widget.bind("<ButtonRelease-1>", self._on_main_release)
@@ -178,6 +206,7 @@ class FloatingButton:
                 self._main_area = main
                 self._main_label = label
                 self._toggle_button = toggle
+                self._preview_label = preview
                 self._place(root)
                 self._apply_state()
             except Exception as exc:  # noqa: BLE001
@@ -242,14 +271,21 @@ class FloatingButton:
             return
         x = self._root.winfo_x()
         y = self._root.winfo_y()
-        if self._collapsed:
+        was_collapsed = self._collapsed
+        if was_collapsed:
             self._body.pack(fill="both", expand=True)
-            width, height = _EXPANDED_SIZE
         else:
             self._body.pack_forget()
+            if self._preview_label is not None:
+                self._preview_label.pack_forget()
+        self._collapsed = not was_collapsed
+        if self._collapsed:
             width, height = _COLLAPSED_SIZE
-        self._collapsed = not self._collapsed
-        self._root.geometry(f"{width}x{height}+{x}+{y}")
+            self._root.geometry(f"{width}x{height}+{x}+{y}")
+        else:
+            # Let _apply_state decide expanded vs. preview size (and re-show
+            # the preview label if there is preview text waiting).
+            self._apply_state()
 
     def _on_main_press(self, _event=None):
         self._controller.press_main()
@@ -287,6 +323,7 @@ class FloatingButton:
             return
         with self._lock:
             state = self._state
+            preview_text = self._preview_text
         if state == "recording":
             bg, dot, text = _RECORDING_BG, _RECORDING_DOT, "录音中"
             symbol = "■"
@@ -305,6 +342,37 @@ class FloatingButton:
             activeforeground=dot,
             text=symbol,
         )
+        if self._preview_label is not None:
+            if self._collapsed or not preview_text:
+                self._preview_label.pack_forget()
+                target_size = _EXPANDED_SIZE
+            else:
+                self._preview_label.configure(bg=bg, fg=_MUTED, text=preview_text)
+                self._preview_label.pack(side="top", fill="x", padx=0, pady=(0, 6))
+                target_size = _PREVIEW_SIZE
+            self._resize_to(target_size)
+
+    def _resize_to(self, size) -> None:
+        if self._root is None:
+            return
+        width, height = size
+        if self._root.winfo_width() == width and self._root.winfo_height() == height:
+            return
+        x = self._root.winfo_x()
+        y = self._root.winfo_y()
+        self._root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def show_preview(self, committed: str, tail: str, state: str) -> None:
+        with self._lock:
+            max_chars = self._preview_max_chars
+            self._preview_text = render_preview_text(committed, tail, max_chars=max_chars)
+            self._state = state
+        self._dispatch(self._apply_state)
+
+    def clear_preview(self) -> None:
+        with self._lock:
+            self._preview_text = ""
+        self._dispatch(self._apply_state)
 
     def _set_state(self, state: str) -> None:
         self._ensure_built()
