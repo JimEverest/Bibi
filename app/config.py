@@ -100,6 +100,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "append_newline": False,
     },
     "logging": {"dir": "logs", "level": "INFO"},
+    "streaming": {
+        "enabled": True,
+        "segment_silence_ms": 450,
+        "audio_overlap_ms": 500,
+        "preview_context_chars": 30,
+        "preview_max_chars": 120,
+        "ui_update_debounce_ms": 80,
+        "dedicated_model_instance": False,
+    },
 }
 
 
