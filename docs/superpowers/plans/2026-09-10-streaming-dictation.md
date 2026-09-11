@@ -386,7 +386,7 @@ class StreamingSegmenterTests(unittest.TestCase):
         self.assertEqual(emitted[0].sequence, 1)
 
     def test_second_segment_contains_overlap_samples(self):
-        segmenter = StreamingSegmenter(sample_rate=16000, silence_ms=200, overlap_ms=100)
+        segmenter = StreamingSegmenter(sample_rate=16000, silence_ms=100, overlap_ms=100)
         speech = np.ones(1600, dtype=np.int16)
         silence = np.zeros(1600, dtype=np.int16)
 
