@@ -156,6 +156,56 @@ class StreamingSegmenterTests(unittest.TestCase):
         preview_tasks = [t for t in emitted if t.kind == "preview"]
         self.assertEqual(len(preview_tasks), 0)
 
+    def test_is_final_does_not_double_commit_after_pause_triggered_commit(self):
+        # Regression: a commit fired mid-recording from a long pause, leaving
+        # only the leftover onset pad in the buffer. If no further real
+        # audio arrives before finish()/is_final, there must be NO second
+        # spurious commit of just that pad.
+        segmenter = self._segmenter(silence_ms=200, commit_silence_ms=600)
+        speech = np.ones(1600, dtype=np.int16)
+        silence = np.zeros(1600, dtype=np.int16)
+
+        emitted = []
+        emitted.extend(segmenter.push_chunk(speech, is_speech=True))
+        for _ in range(6):  # 600ms silence -> crosses commit_silence_ms
+            emitted.extend(segmenter.push_chunk(silence, is_speech=False))
+
+        commit_tasks = [t for t in emitted if t.kind == "commit"]
+        self.assertEqual(len(commit_tasks), 1)
+
+        dummy = np.zeros(0, dtype=np.int16)
+        final_emitted = segmenter.push_chunk(dummy, is_speech=False, is_final=True)
+        self.assertEqual(final_emitted, [])
+
+        total_commits = commit_tasks + [t for t in final_emitted if t.kind == "commit"]
+        self.assertEqual(len(total_commits), 1)
+
+    def test_is_final_flushes_new_content_arriving_after_a_commit(self):
+        # A commit fires, then MORE real speech/silence arrives before
+        # finish() -- that new bit (plus the leftover pad) must still be
+        # flushed as a final commit.
+        segmenter = self._segmenter(silence_ms=200, commit_silence_ms=600, overlap_ms=100)
+        speech = np.ones(1600, dtype=np.int16)
+        silence = np.zeros(1600, dtype=np.int16)
+
+        emitted = []
+        emitted.extend(segmenter.push_chunk(speech, is_speech=True))
+        for _ in range(6):
+            emitted.extend(segmenter.push_chunk(silence, is_speech=False))
+        commit_tasks = [t for t in emitted if t.kind == "commit"]
+        self.assertEqual(len(commit_tasks), 1)
+
+        # a bit more speech arrives after the commit
+        more_speech = np.ones(1600, dtype=np.int16) * 2
+        segmenter.push_chunk(more_speech, is_speech=True)
+
+        dummy = np.zeros(0, dtype=np.int16)
+        final_emitted = segmenter.push_chunk(dummy, is_speech=False, is_final=True)
+        self.assertEqual(len(final_emitted), 1)
+        self.assertEqual(final_emitted[0].kind, "commit")
+        # onset pad (1600) + new speech (1600)
+        self.assertEqual(len(final_emitted[0].samples), 1600 + 1600)
+
     def test_is_final_always_flushes_remaining_buffer_as_commit(self):
         segmenter = self._segmenter(silence_ms=200, commit_silence_ms=600)
         speech = np.ones(1600, dtype=np.int16)

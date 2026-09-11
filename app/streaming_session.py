@@ -94,6 +94,15 @@ class StreamingSegmenter:
         self._preview_emitted_this_pause = False
         self._commit_emitted_this_pause = False
         self._sequence = 0
+        # Tracks whether the uncommitted buffer holds any genuinely new audio
+        # (real speech, or silence appended after speech) since the buffer
+        # was last cleared to its onset pad by a commit. This is distinct
+        # from `bool(self._uncommitted_chunks)`, which stays True even when
+        # the buffer contains *only* the leftover onset pad with nothing new
+        # added -- that pad is a copy of already-committed audio, not new
+        # content, and must not trigger a spurious extra commit on
+        # `is_final`.
+        self._has_new_content_since_commit = False
 
     def push_chunk(self, samples: np.ndarray, is_speech: bool, is_final: bool = False) -> list[SegmentTask]:
         emitted: list[SegmentTask] = []
@@ -104,12 +113,15 @@ class StreamingSegmenter:
             self._silence_samples = 0
             self._preview_emitted_this_pause = False
             self._commit_emitted_this_pause = False
+            self._has_new_content_since_commit = True
             if self._uncommitted_total_samples >= self._max_uncommitted_samples:
                 emitted.append(self._emit_task(kind="commit", clear_to_pad=True))
         elif self._uncommitted_chunks:
             self._uncommitted_chunks.append(samples)
             self._uncommitted_total_samples += samples.size
             self._silence_samples += samples.size
+            if samples.size > 0:
+                self._has_new_content_since_commit = True
             if not self._commit_emitted_this_pause and self._silence_samples >= self._commit_silence_samples_limit:
                 emitted.append(self._emit_task(kind="commit", clear_to_pad=True))
                 self._commit_emitted_this_pause = True
@@ -118,7 +130,7 @@ class StreamingSegmenter:
                 emitted.append(self._emit_task(kind="preview", clear_to_pad=False))
                 self._preview_emitted_this_pause = True
 
-        if is_final and self._uncommitted_chunks:
+        if is_final and self._has_new_content_since_commit:
             emitted.append(self._emit_task(kind="commit", clear_to_pad=True))
 
         return emitted
@@ -139,6 +151,7 @@ class StreamingSegmenter:
             else:
                 self._uncommitted_chunks = []
                 self._uncommitted_total_samples = 0
+            self._has_new_content_since_commit = False
 
         return task
 
