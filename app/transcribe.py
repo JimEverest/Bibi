@@ -281,14 +281,18 @@ class TranscriptionWorker:
         
         # 第二阶段：在锁外执行耗时操作
         self.audio.stop()
-        if self._streaming_session is not None:
-            self._streaming_session.finish()
 
         # 只有从外部调用时才join capture线程，避免自己join自己
         # 使用保存的线程引用，而不是self._capture_thread
+        # 必须在调用 streaming_session.finish() 之前完成 join，
+        # 确保 capture 线程不会再并发调用 push_chunk()，
+        # 否则会与 finish() 内部对 StreamingSegmenter 状态的操作产生数据竞争。
         if not _from_capture_thread:
             if capture_thread_to_join and capture_thread_to_join.is_alive():
                 capture_thread_to_join.join(timeout=5)
+
+        if self._streaming_session is not None:
+            self._streaming_session.finish()
 
         combined = self._combine_buffer()
         self.audio.flush()

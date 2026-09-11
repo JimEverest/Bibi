@@ -330,6 +330,7 @@ def _make_result_handler(
         if result.error:
             logger.error("转写失败: %s", result.error)
             if floating_button is not None:
+                floating_button.clear_preview()
                 floating_button.show_idle()
             return
 
