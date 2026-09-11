@@ -126,6 +126,7 @@ class StreamingSession:
         self._asr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-asr")
         self._llm_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-llm")
         self._lock = threading.Lock()
+        self._preview_lock = threading.Lock()
         self._closed = True
 
     def start(self) -> None:
@@ -153,22 +154,28 @@ class StreamingSession:
         result = self._transcribe_segment(task.samples)
         if not result.get("success"):
             return
-        snap = self._preview.apply_asr_segment(task.sequence, result.get("text", ""))
-        self._on_preview(snap.committed, snap.tail, "recording")
+        prefix_context = None
+        with self._preview_lock:
+            snap = self._preview.apply_asr_segment(task.sequence, result.get("text", ""))
+            self._on_preview(snap.committed, snap.tail, "recording")
+            if self._polish_tail is not None and snap.tail:
+                prefix_context = self._preview.context_prefix()
         if self._polish_tail is not None and snap.tail:
             self._llm_pool.submit(
                 self._run_llm_task,
                 task.sequence,
-                self._preview.context_prefix(),
+                prefix_context,
                 snap.tail,
             )
 
     def _run_llm_task(self, sequence: int, prefix_context: str, tail_text: str) -> None:
         def _on_update(partial: str) -> None:
-            snap = self._preview.apply_llm_update(sequence, partial)
-            self._on_preview(snap.committed, snap.tail, "processing")
+            with self._preview_lock:
+                snap = self._preview.apply_llm_update(sequence, partial)
+                self._on_preview(snap.committed, snap.tail, "processing")
 
         final_text = self._polish_tail(prefix_context, tail_text, _on_update)
         if final_text:
-            snap = self._preview.apply_llm_update(sequence, final_text)
-            self._on_preview(snap.committed, snap.tail, "processing")
+            with self._preview_lock:
+                snap = self._preview.apply_llm_update(sequence, final_text)
+                self._on_preview(snap.committed, snap.tail, "processing")
