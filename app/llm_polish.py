@@ -449,3 +449,92 @@ class LLMPolisher:
             text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
             text = re.sub(r"\n?```$", "", text)
         return text.strip()
+
+    # ---------- streaming tail-polish (方案6：流式尾部润色) ----------
+
+    def _build_tail_stream_prompt(
+        self, prefix_context: str, tail_text: str, extra_vocab: list[str] | None = None
+    ) -> str:
+        vocab_section = self._build_vocab_section(extra_vocab)
+        return (
+            "你会收到不可改写的参考前文和一个可编辑尾巴。"
+            "只能润色尾巴，禁止改写参考前文。\n\n"
+            f"参考前文（不可改写）：\n{prefix_context}\n\n"
+            f"可编辑尾巴：\n{tail_text}\n\n"
+            f"{vocab_section}"
+            "直接返回润色后的尾巴，不要解释。"
+        )
+
+    def _http_post_sse(self, url: str, headers: dict, body: dict):
+        data = json.dumps(body).encode("utf-8")
+        opener = urllib.request.build_opener()
+        req = urllib.request.Request(url, data=data, method="POST")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        req.add_header("Content-Type", "application/json")
+        with opener.open(req, timeout=self.timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                yield json.loads(payload)
+
+    def polish_tail_stream(
+        self,
+        prefix_context: str,
+        tail_text: str,
+        extra_vocab: list[str] | None = None,
+        on_update=None,
+    ) -> str | None:
+        if not self.is_enabled() or not tail_text.strip():
+            return None
+
+        prompt = self._build_tail_stream_prompt(prefix_context, tail_text, extra_vocab)
+        pieces: list[str] = []
+
+        try:
+            if self.schema == "anthropic":
+                headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}
+                body = {
+                    "model": self.model,
+                    "max_tokens": self.max_tokens,
+                    "temperature": self.temperature,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                body.update(self._thinking_fields("anthropic"))
+                stream = self._http_post_sse(self.endpoint, headers, body)
+                for event in stream:
+                    if event.get("type") != "content_block_delta":
+                        continue
+                    delta = (event.get("delta") or {}).get("text", "")
+                    if delta:
+                        pieces.append(delta)
+                        if on_update is not None:
+                            on_update(self._clean("".join(pieces)))
+            else:
+                headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+                body = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": self.temperature,
+                    "stream": True,
+                }
+                body.update(self._thinking_fields("openai"))
+                stream = self._http_post_sse(self.endpoint, headers, body)
+                for event in stream:
+                    choices = event.get("choices") or [{}]
+                    delta = (choices[0].get("delta") or {}).get("content", "")
+                    if delta:
+                        pieces.append(delta)
+                        if on_update is not None:
+                            on_update(self._clean("".join(pieces)))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("LLM 流式润色失败（降级为 ASR 文本）: %s", exc)
+            return None
+
+        text = self._clean("".join(pieces))
+        return text or None
