@@ -366,7 +366,12 @@ class FloatingButton:
         with self._lock:
             max_chars = self._preview_max_chars
             self._preview_text = render_preview_text(committed, tail, max_chars=max_chars)
-            self._state = state
+            # 录音仍在进行时，"processing" 只表示 LLM 正在后台润色某一段尾巴文本，
+            # 并不代表录音已经结束；这种瞬时状态不应覆盖主胶囊的"录音中"外观
+            # （"处理中"外观是留给 show_processing() 在录音真正停止后使用的），
+            # 否则容易让用户误以为录音已经停止而提前松手/点击。
+            if not (state == "processing" and self._state == "recording"):
+                self._state = state
         self._dispatch(self._apply_state)
 
     def clear_preview(self) -> None:

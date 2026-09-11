@@ -48,6 +48,9 @@ class PreviewAssembler:
         self._tail = ""
         return self.snapshot()
 
+    def context_prefix(self) -> str:
+        return self._committed[-self._context_chars :]
+
     @staticmethod
     def _merge_tail(existing_tail: str, new_text: str) -> str:
         max_overlap = min(len(existing_tail), len(new_text))
@@ -121,6 +124,7 @@ class StreamingSession:
             overlap_ms=int(streaming_cfg.get("audio_overlap_ms", 500)),
         )
         self._asr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-asr")
+        self._llm_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-llm")
         self._lock = threading.Lock()
         self._closed = True
 
@@ -143,6 +147,7 @@ class StreamingSession:
         for task in self._segmenter.push_chunk(dummy, is_speech=False, is_final=True):
             self._asr_pool.submit(self._run_asr_task, task)
         self._asr_pool.shutdown(wait=True)
+        self._llm_pool.shutdown(wait=True)
 
     def _run_asr_task(self, task: SegmentTask) -> None:
         result = self._transcribe_segment(task.samples)
@@ -150,3 +155,20 @@ class StreamingSession:
             return
         snap = self._preview.apply_asr_segment(task.sequence, result.get("text", ""))
         self._on_preview(snap.committed, snap.tail, "recording")
+        if self._polish_tail is not None and snap.tail:
+            self._llm_pool.submit(
+                self._run_llm_task,
+                task.sequence,
+                self._preview.context_prefix(),
+                snap.tail,
+            )
+
+    def _run_llm_task(self, sequence: int, prefix_context: str, tail_text: str) -> None:
+        def _on_update(partial: str) -> None:
+            snap = self._preview.apply_llm_update(sequence, partial)
+            self._on_preview(snap.committed, snap.tail, "processing")
+
+        final_text = self._polish_tail(prefix_context, tail_text, _on_update)
+        if final_text:
+            snap = self._preview.apply_llm_update(sequence, final_text)
+            self._on_preview(snap.committed, snap.tail, "processing")

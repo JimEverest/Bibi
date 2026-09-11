@@ -104,5 +104,33 @@ class StreamingSessionTests(unittest.TestCase):
         self.assertIn(("", "第一句", "recording"), events)
 
 
+class StreamingSessionLLMTests(unittest.TestCase):
+    def test_llm_partial_updates_replace_only_tail(self):
+        previews = []
+        partials = ["今天下午", "今天下午开会"]
+
+        def polish_tail(prefix_context, tail_text, on_update):
+            for partial in partials:
+                on_update(partial)
+            return partials[-1]
+
+        session = StreamingSession(
+            sample_rate=16000,
+            streaming_cfg={"segment_silence_ms": 200, "audio_overlap_ms": 100, "preview_context_chars": 20},
+            detect_speech=lambda samples, is_final=False: bool(samples.max()),
+            transcribe_segment=lambda samples: {"success": True, "text": "今天下午开会"},
+            polish_tail=polish_tail,
+            on_preview=lambda committed, tail, state: previews.append((committed, tail, state)),
+        )
+        session.start()
+        session.push_chunk(__import__("numpy").ones(1600, dtype=__import__("numpy").int16))
+        session.push_chunk(__import__("numpy").zeros(1600, dtype=__import__("numpy").int16))
+        session.push_chunk(__import__("numpy").zeros(1600, dtype=__import__("numpy").int16))
+        session.finish()
+
+        self.assertIn(("", "今天下午", "processing"), previews)
+        self.assertIn(("", "今天下午开会", "processing"), previews)
+
+
 if __name__ == "__main__":
     unittest.main()
