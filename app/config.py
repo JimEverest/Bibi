@@ -11,9 +11,11 @@ from typing import Any, Dict, Optional
 DEFAULT_CONFIG: Dict[str, Any] = {
     "hotkeys": {
         "toggle": "f2",
+        "toggle_enabled": True,
         # 按住说话（push-to-talk）：组合键全部按下开始录音，任一键松开停止。
         # 设为 "none" 或空可禁用
         "push_to_talk": "win+ctrl+alt",
+        "push_to_talk_enabled": True,
     },
     "audio": {
         "sample_rate": 16000,

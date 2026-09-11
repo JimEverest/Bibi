@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 from pathlib import Path
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,20 @@ def load_settings(path: str | None = None) -> dict:
         return {}
 
 
+def collect_hotkey_settings(
+    toggle: str,
+    push_to_talk: str,
+    toggle_enabled: bool,
+    push_to_talk_enabled: bool,
+) -> dict:
+    return {
+        "toggle": toggle.strip() or "f2",
+        "toggle_enabled": bool(toggle_enabled),
+        "push_to_talk": push_to_talk.strip().lower() or "none",
+        "push_to_talk_enabled": bool(push_to_talk_enabled),
+    }
+
+
 def save_settings(cfg: dict, path: str | None = None) -> bool:
     path = path or _default_config_path()
     try:
@@ -52,7 +67,10 @@ def save_settings(cfg: dict, path: str | None = None) -> bool:
         return False
 
 
-def open_settings_dialog(config_path: str | None = None) -> None:
+def open_settings_dialog(
+    config_path: str | None = None,
+    llm_enabled_callback: Callable[[bool], None] | None = None,
+) -> None:
     """打开设置窗口。
 
     线程模型：Tk root 唯一且在主线程（UIHub）。本函数可在托盘线程调用，
@@ -78,7 +96,11 @@ def open_settings_dialog(config_path: str | None = None) -> None:
                         return
                 except Exception:
                     pass
-            _current_window = _SettingsWindow(path, master=hub.root)
+            _current_window = _SettingsWindow(
+                path,
+                master=hub.root,
+                llm_enabled_callback=llm_enabled_callback,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("设置窗口打开失败: %s", exc)
 
@@ -90,13 +112,19 @@ _current_window: "_SettingsWindow | None" = None
 
 
 class _SettingsWindow:
-    def __init__(self, config_path: str, master=None):
+    def __init__(
+        self,
+        config_path: str,
+        master=None,
+        llm_enabled_callback: Callable[[bool], None] | None = None,
+    ):
         import tkinter as tk
         from tkinter import ttk
 
         self._tk = tk
         self._ttk = ttk
         self._path = config_path
+        self._llm_enabled_callback = llm_enabled_callback
         self._cfg = load_settings(config_path)
         self._dirty = False
 
@@ -116,43 +144,53 @@ class _SettingsWindow:
         g = ttk.Frame(nb, padding=12)
         nb.add(g, text="常规")
 
+        hotkeys = self._cfg.get("hotkeys", {})
         ttk.Label(g, text="听写快捷键（如 f2 / ctrl+alt+v，重启生效）:").grid(row=0, column=0, sticky="w", pady=4)
         self.e_hotkey = ttk.Entry(g, width=18)
-        self.e_hotkey.insert(0, str(self._cfg.get("hotkeys", {}).get("toggle", "f2")))
+        self.e_hotkey.insert(0, str(hotkeys.get("toggle", "f2")))
         self.e_hotkey.grid(row=0, column=1, sticky="w", pady=4)
+        self.var_toggle_enabled = tk.BooleanVar(value=bool(hotkeys.get("toggle_enabled", True)))
+        ttk.Checkbutton(g, text="启用听写快捷键", variable=self.var_toggle_enabled).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=4)
 
-        ttk.Label(g, text="按住说话热键（按住录音、松开停止；none 禁用）:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(g, text="按住说话热键（按住录音、松开停止；none 禁用）:").grid(row=2, column=0, sticky="w", pady=4)
         self.e_ptt = ttk.Entry(g, width=18)
-        self.e_ptt.insert(0, str(self._cfg.get("hotkeys", {}).get("push_to_talk", "win+ctrl+alt")))
-        self.e_ptt.grid(row=1, column=1, sticky="w", pady=4)
+        self.e_ptt.insert(0, str(hotkeys.get("push_to_talk", "win+ctrl+alt")))
+        self.e_ptt.grid(row=2, column=1, sticky="w", pady=4)
+        self.var_ptt_enabled = tk.BooleanVar(value=bool(hotkeys.get("push_to_talk_enabled", True)))
+        ttk.Checkbutton(g, text="启用按住说话快捷键", variable=self.var_ptt_enabled).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Label(g, text="悬浮胶囊按钮始终可用（按住说话或点击切换）", foreground="#555").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=4)
 
         self.var_indicator = tk.BooleanVar(value=bool(self._cfg.get("ui", {}).get("show_indicator", True)))
         ttk.Checkbutton(g, text="显示录音指示浮窗（立即生效）", variable=self.var_indicator).grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=4)
+            row=5, column=0, columnspan=2, sticky="w", pady=4)
 
-        ttk.Label(g, text="文本输出方式:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(g, text="文本输出方式:").grid(row=6, column=0, sticky="w", pady=4)
         self.cb_output = ttk.Combobox(g, width=15, state="readonly",
                                       values=["auto", "type", "clipboard", "unicode"])
         self.cb_output.set(str(self._cfg.get("output", {}).get("method", "auto")))
-        self.cb_output.grid(row=3, column=1, sticky="w", pady=4)
+        self.cb_output.grid(row=6, column=1, sticky="w", pady=4)
 
-        ttk.Label(g, text="单次录音上限（秒，防误触长录音）:").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Label(g, text="单次录音上限（秒，防误触长录音）:").grid(row=7, column=0, sticky="w", pady=4)
         self.e_maxsec = ttk.Entry(g, width=10)
         self.e_maxsec.insert(0, str(int(self._cfg.get("audio", {}).get("max_session_bytes", 2 * 1024 * 1024) / 32000)))
-        self.e_maxsec.grid(row=4, column=1, sticky="w", pady=4)
+        self.e_maxsec.grid(row=7, column=1, sticky="w", pady=4)
 
-        ttk.Label(g, text="麦克风输入增益（1~20，音量小调大）:").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Label(g, text="麦克风输入增益（1~20，音量小调大）:").grid(row=8, column=0, sticky="w", pady=4)
         self.e_gain = ttk.Entry(g, width=10)
         self.e_gain.insert(0, str(float(self._cfg.get("audio", {}).get("gain", 12.0))))
-        self.e_gain.grid(row=5, column=1, sticky="w", pady=4)
+        self.e_gain.grid(row=8, column=1, sticky="w", pady=4)
 
         self.var_save_wav = tk.BooleanVar(value=bool(self._cfg.get("audio", {}).get("save_recordings", False)))
         ttk.Checkbutton(g, text="保存录音 WAV 到 logs/（默认关闭；仅供调试，开启后磁盘会持续增长，重启生效）",
                         variable=self.var_save_wav).grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=4)
+            row=9, column=0, columnspan=2, sticky="w", pady=4)
 
         ttk.Button(g, text="一键清理日志与录音文件…", command=self._clean_house).grid(
-            row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            row=10, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         for c in range(2):
             g.columnconfigure(c, weight=1 if c else 0)
@@ -163,7 +201,7 @@ class _SettingsWindow:
         nb.add(f, text="LLM 润色")
 
         self.var_llm_enabled = tk.BooleanVar(value=bool(llm.get("enabled", False)))
-        ttk.Checkbutton(f, text="启用 LLM 二次润色（重启生效；失败自动降级）",
+        ttk.Checkbutton(f, text="启用 LLM 二次润色（立即生效；失败自动降级）",
                         variable=self.var_llm_enabled).grid(row=0, column=0, columnspan=2, sticky="w", pady=4)
 
         ttk.Label(f, text="协议 schema:").grid(row=1, column=0, sticky="w", pady=4)
@@ -362,8 +400,12 @@ class _SettingsWindow:
 
     def _collect(self) -> dict:
         cfg = dict(self._cfg)
-        cfg.setdefault("hotkeys", {})["toggle"] = self.e_hotkey.get().strip() or "f2"
-        cfg["hotkeys"]["push_to_talk"] = self.e_ptt.get().strip().lower() or "none"
+        cfg["hotkeys"] = collect_hotkey_settings(
+            self.e_hotkey.get(),
+            self.e_ptt.get(),
+            self.var_toggle_enabled.get(),
+            self.var_ptt_enabled.get(),
+        )
         cfg.setdefault("ui", {})["show_indicator"] = bool(self.var_indicator.get())
         cfg.setdefault("output", {})["method"] = self.cb_output.get()
         try:
@@ -415,7 +457,9 @@ class _SettingsWindow:
         cfg = self._collect()
         if save_settings(cfg, self._path):
             self._dirty = False
-            self._msg.config(text="已保存。快捷键/LLM 开关需重启程序生效。")
+            if self._llm_enabled_callback is not None:
+                self._llm_enabled_callback(bool(cfg["llm"]["enabled"]))
+            self._msg.config(text="已保存。LLM 开关立即生效；快捷键等设置需重启程序生效。")
         else:
             self._msg.config(text="保存失败，请检查文件权限。", foreground="#c0392b")
 

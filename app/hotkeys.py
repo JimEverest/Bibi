@@ -11,6 +11,12 @@ import keyboard
 
 logger = logging.getLogger(__name__)
 
+_DISABLED_HOTKEY_VALUES = {"", "none", "off", "disabled"}
+
+
+def is_hotkey_enabled(combo: str | None) -> bool:
+    return bool(combo and str(combo).strip().lower() not in _DISABLED_HOTKEY_VALUES)
+
 
 class HotkeyManager:
     def __init__(self) -> None:
@@ -19,6 +25,10 @@ class HotkeyManager:
         self._ptt_hooks = []
 
     def register(self, combo: str, callback: Callable[[], None]) -> None:
+        if not is_hotkey_enabled(combo):
+            logger.info("热键未配置或已禁用")
+            return
+
         with self._lock:
             if combo in self._registrations:
                 logger.warning("热键 %s 已注册，覆盖旧的回调", combo)
@@ -51,8 +61,12 @@ class HotkeyManager:
 
         与 toggle 模式互相独立；组合键为空字符串或 "none" 时视为禁用。
         """
+        if not is_hotkey_enabled(combo):
+            logger.info("PTT 按住说话未配置或已禁用")
+            return
+
         keys = [k.strip().lower() for k in combo.split("+") if k.strip()]
-        if not keys or combo.strip().lower() in ("", "none", "off", "disabled"):
+        if not keys:
             logger.info("PTT 按住说话未配置或已禁用")
             return
 

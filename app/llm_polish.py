@@ -26,11 +26,26 @@ from __future__ import annotations
 import json
 import logging
 import re
+import socket
 import ssl
+import threading
+import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
+
+
+class _LLMFailure(RuntimeError):
+    def __init__(self, category: str, detail: str):
+        self.category = category
+        self.detail = detail
+        super().__init__(detail)
+
+    def __str__(self) -> str:
+        return f"{self.category}: {self.detail}"
+
 
 # 润色 prompt（结构参考 ququ 项目 optimize 模板，按中英混合 dictation 场景增补）
 # 占位符：{TEXT} = 待润色文本；{VOCAB} = 领域词汇提示（无则整段为空）
@@ -84,12 +99,14 @@ class LLMPolisher:
     """调用 LLM 做二次润色。所有失败路径都返回 None（调用方降级）。"""
 
     def __init__(self, llm_config: dict):
-        self.enabled = bool(llm_config.get("enabled", False))
+        self._enabled_lock = threading.Lock()
+        self._enabled = bool(llm_config.get("enabled", False))
         self.endpoint = str(llm_config.get("endpoint", "")).rstrip("/")
         self.schema = str(llm_config.get("schema", "openai")).lower()
         self.api_key = str(llm_config.get("api_key", ""))
         self.model = str(llm_config.get("model", ""))
         self.timeout = float(llm_config.get("timeout_seconds", 15))
+        self.max_tokens = int(llm_config.get("max_tokens", 512))
         self.temperature = float(llm_config.get("temperature", 0.3))
         prompt = str(llm_config.get("prompt", "")).strip()
         self.prompt_template = prompt if prompt else DEFAULT_PROMPT
@@ -114,13 +131,29 @@ class LLMPolisher:
 
     # ---------- public ----------
 
+    @property
+    def enabled(self) -> bool:
+        with self._enabled_lock:
+            return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        with self._enabled_lock:
+            self._enabled = bool(value)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def is_enabled(self) -> bool:
+        return self.enabled
+
     def polish(self, text: str, extra_vocab: list[str] | None = None) -> str | None:
         """润色文本。任何失败返回 None。disabled 也返回 None。
 
         extra_vocab: 调用方（如术语词典）提供的领域词汇提示，与配置里的
         vocabulary 合并注入 prompt 的 {VOCAB} 占位符。
         """
-        if not self.enabled or not text or not text.strip():
+        if not self.is_enabled() or not text or not text.strip():
             return None
         if not self.endpoint or not self.model:
             logger.warning("LLM 润色已启用但 endpoint/model 未配置，跳过润色")
@@ -131,8 +164,20 @@ class LLMPolisher:
             if self.schema == "anthropic":
                 return self._call_anthropic(prompt)
             return self._call_openai(prompt)
+        except _LLMFailure as exc:
+            logger.warning(
+                "LLM 润色失败（降级为原文本）: category=%s detail=%s",
+                exc.category,
+                exc.detail,
+            )
+            return None
         except Exception as exc:  # noqa: BLE001
-            logger.warning("LLM 润色失败（降级为原文本）: %s", exc)
+            logger.warning(
+                "LLM 润色失败（降级为原文本）: category=unexpected "
+                "error_type=%s detail=%s",
+                type(exc).__name__,
+                exc,
+            )
             return None
 
     # ---------- protocols ----------
@@ -151,6 +196,15 @@ class LLMPolisher:
 
     def _http_post_json(self, url: str, headers: dict, body: dict) -> dict:
         data = json.dumps(body).encode("utf-8")
+        safe_url = self._safe_url(url)
+        started = time.monotonic()
+        headers_received = False
+        logger.info(
+            "LLM HTTP请求开始: method=POST endpoint=%s timeout=%.1fs body_bytes=%d",
+            safe_url,
+            self.timeout,
+            len(data),
+        )
         # 代理：按 URL 协议选择 http_proxy / https_proxy（留空 = 直连）
         proxy = self.https_proxy if url.lower().startswith("https") else self.http_proxy
         handlers = []
@@ -166,9 +220,128 @@ class LLMPolisher:
         for k, v in headers.items():
             req.add_header(k, v)
         req.add_header("Content-Type", "application/json")
-        with opener.open(req, timeout=self.timeout) as resp:
-            payload = resp.read().decode("utf-8", errors="replace")
-        return json.loads(payload)
+        try:
+            with opener.open(req, timeout=self.timeout) as resp:
+                headers_received = True
+                status = getattr(resp, "status", None) or resp.getcode()
+                logger.debug(
+                    "LLM HTTP响应头已收到: endpoint=%s status=%s elapsed=%.2fs",
+                    safe_url,
+                    status,
+                    time.monotonic() - started,
+                )
+                payload = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            payload = self._read_error_body(exc)
+            elapsed = time.monotonic() - started
+            logger.warning(
+                "LLM HTTP请求失败: category=http endpoint=%s status=%s "
+                "elapsed=%.2fs response=%s",
+                safe_url,
+                exc.code,
+                elapsed,
+                self._preview(payload),
+            )
+            raise _LLMFailure(
+                "http",
+                f"status={exc.code} reason={exc.reason!s} elapsed={elapsed:.2f}s "
+                f"response={self._preview(payload)}",
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            elapsed = time.monotonic() - started
+            phase = "response_body" if headers_received else "connect_or_response_headers"
+            logger.warning(
+                "LLM HTTP请求超时: category=timeout endpoint=%s phase=%s "
+                "elapsed=%.2fs timeout=%.1fs error=%s",
+                safe_url,
+                phase,
+                elapsed,
+                self.timeout,
+                exc,
+            )
+            raise _LLMFailure(
+                "timeout",
+                f"phase={phase} elapsed={elapsed:.2f}s limit={self.timeout:.1f}s",
+            ) from exc
+        except urllib.error.URLError as exc:
+            elapsed = time.monotonic() - started
+            logger.warning(
+                "LLM HTTP请求失败: category=transport endpoint=%s elapsed=%.2fs "
+                "reason=%s",
+                safe_url,
+                elapsed,
+                exc.reason,
+            )
+            raise _LLMFailure(
+                "transport",
+                f"elapsed={elapsed:.2f}s reason={exc.reason!s}",
+            ) from exc
+        except OSError as exc:
+            elapsed = time.monotonic() - started
+            logger.warning(
+                "LLM HTTP请求失败: category=os_error endpoint=%s elapsed=%.2fs "
+                "error_type=%s detail=%s",
+                safe_url,
+                elapsed,
+                type(exc).__name__,
+                exc,
+            )
+            raise _LLMFailure(
+                "os_error",
+                f"elapsed={elapsed:.2f}s error_type={type(exc).__name__} detail={exc}",
+            ) from exc
+
+        elapsed = time.monotonic() - started
+        logger.info(
+            "LLM HTTP请求完成: endpoint=%s status=%s elapsed=%.2fs response_bytes=%d",
+            safe_url,
+            status,
+            elapsed,
+            len(payload.encode("utf-8")),
+        )
+        try:
+            result = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "LLM响应解析失败: category=json endpoint=%s elapsed=%.2fs "
+                "response=%s",
+                safe_url,
+                elapsed,
+                self._preview(payload),
+            )
+            raise _LLMFailure(
+                "json",
+                f"elapsed={elapsed:.2f}s line={exc.lineno} column={exc.colno} "
+                f"response={self._preview(payload)}",
+            ) from exc
+        if not isinstance(result, dict):
+            raise _LLMFailure(
+                "response",
+                f"expected=object actual={type(result).__name__} elapsed={elapsed:.2f}s",
+            )
+        return result
+
+    @staticmethod
+    def _safe_url(url: str) -> str:
+        parts = urlsplit(url)
+        host = parts.hostname or "<invalid-host>"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        return f"{parts.scheme or '<invalid-scheme>'}://{host}{parts.path or '/'}"
+
+    @staticmethod
+    def _preview(payload: str, limit: int = 500) -> str:
+        compact = " ".join(payload.split())
+        return compact[:limit] + ("..." if len(compact) > limit else "")
+
+    @staticmethod
+    def _read_error_body(exc: urllib.error.HTTPError) -> str:
+        try:
+            return exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return "<unavailable>"
 
     def _thinking_fields(self, schema: str) -> dict:
         """按 schema 生成思考模式控制字段。
@@ -208,7 +381,10 @@ class LLMPolisher:
                 for c in item.get("content", []):
                     if c.get("type") == "output_text" and c.get("text"):
                         return self._clean(c["text"])
-            return None
+            raise _LLMFailure(
+                "response",
+                f"OpenAI responses 中没有 output_text: {self._preview_data(data)}",
+            )
         # 经典 /chat/completions
         body = {
             "model": self.model,
@@ -220,10 +396,17 @@ class LLMPolisher:
         data = self._http_post_json(self.endpoint, headers, body)
         choices = data.get("choices") or []
         if not choices:
-            logger.warning("OpenAI 响应无 choices: %s", str(data)[:200])
-            return None
+            raise _LLMFailure(
+                "response",
+                f"OpenAI 响应无 choices: {self._preview_data(data)}",
+            )
         content = (choices[0].get("message") or {}).get("content", "")
-        return self._clean(str(content)) if content else None
+        if not content:
+            raise _LLMFailure(
+                "response",
+                f"OpenAI 响应 content 为空: {self._preview_data(data)}",
+            )
+        return self._clean(str(content))
 
     def _call_anthropic(self, prompt: str) -> str | None:
         headers = {
@@ -232,7 +415,7 @@ class LLMPolisher:
         }
         body = {
             "model": self.model,
-            "max_tokens": 2048,
+            "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -241,9 +424,22 @@ class LLMPolisher:
         blocks = data.get("content") or []
         texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
         joined = "".join(texts)
-        return self._clean(joined) if joined else None
+        if not joined:
+            raise _LLMFailure(
+                "response",
+                f"Anthropic 响应无 text content: {self._preview_data(data)}",
+            )
+        return self._clean(joined)
 
     # ---------- helpers ----------
+
+    @classmethod
+    def _preview_data(cls, data: dict) -> str:
+        try:
+            payload = json.dumps(data, ensure_ascii=False, default=str)
+        except Exception:  # noqa: BLE001
+            payload = str(data)
+        return cls._preview(payload)
 
     @staticmethod
     def _clean(text: str) -> str:
