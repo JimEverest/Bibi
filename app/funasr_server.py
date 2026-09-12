@@ -8,12 +8,15 @@ FunASR模型服务器
 import argparse
 import json
 import logging
+import threading
 import traceback
 import signal
 import os
 import sys
 import warnings
 import time
+
+import numpy as np
 
 # 过滤掉 jieba 的 pkg_resources 弃用警告
 warnings.filterwarnings("ignore", category=UserWarning, module="jieba._compat")
@@ -31,6 +34,39 @@ from app.logging_config import setup_logging
 logger = logging.getLogger(__name__)
 
 
+def build_streaming_speech_detector(vad_cfg: dict, sample_rate: int):
+    """构建基于能量阈值的流式语音活动检测器。
+
+    `Fsmn_vad_online` 返回的是边界事件而非逐帧语音标志，因此这里使用有状态的
+    RMS 能量阈值检测器，由现有（此前未使用的）`vad.*` 配置项驱动。
+    """
+    start_threshold = float(vad_cfg.get("start_threshold", 0.02))
+    stop_threshold = float(vad_cfg.get("stop_threshold", 0.01))
+    min_speech_ms = float(vad_cfg.get("min_speech_ms", 300))
+    min_silence_ms = float(vad_cfg.get("min_silence_ms", 200))
+
+    state = {"active": False, "speech_ms": 0.0, "silence_ms": 0.0}
+
+    def detect(samples: np.ndarray, is_final: bool = False) -> bool:
+        if samples.size == 0:
+            return state["active"]
+        rms = float(np.sqrt(np.mean((samples.astype("float32") / 32768.0) ** 2)))
+        chunk_ms = samples.size / sample_rate * 1000.0
+        if rms >= start_threshold:
+            state["speech_ms"] += chunk_ms
+            state["silence_ms"] = 0.0
+            if state["speech_ms"] >= min_speech_ms:
+                state["active"] = True
+        elif rms <= stop_threshold:
+            state["silence_ms"] += chunk_ms
+            state["speech_ms"] = 0.0
+            if state["silence_ms"] >= min_silence_ms:
+                state["active"] = False
+        return state["active"]
+
+    return detect
+
+
 class FunASRServer:
     def __init__(self):
         self.asr_model = None
@@ -41,6 +77,8 @@ class FunASRServer:
         self.transcription_count = 0  # 转录计数器
         self.total_audio_duration = 0.0  # 总音频时长
         self.engine = ASR_ENGINE  # sensevoice 或 paraformer
+        # 流式分段识别与会话结束批量识别可能并发调用同一实例，需串行化底层推理
+        self._infer_lock = threading.Lock()
 
         # 使用统一配置
         self.model_revision = MODEL_REVISION
@@ -441,146 +479,167 @@ class FunASRServer:
             if not init_result["success"]:
                 return init_result
 
-        try:
-            # 检查音频文件是否存在
-            if not os.path.exists(audio_path):
-                return {"success": False, "error": f"音频文件不存在: {audio_path}"}
+        with self._infer_lock:
+            try:
+                # 检查音频文件是否存在
+                if not os.path.exists(audio_path):
+                    return {"success": False, "error": f"音频文件不存在: {audio_path}"}
 
-            logger.info(f"开始转录音频文件: {audio_path}")
+                logger.info(f"开始转录音频文件: {audio_path}")
 
-            # 设置默认选项
-            default_options = {
-                "batch_size_s": 60,
-                "hotword": "",
-                # 默认启用 VAD / PUNC，可在外部通过选项或环境变量关闭
-                "use_vad": os.environ.get("FUNASR_USE_VAD", "false").lower() not in ("0", "false", "no"),
-                "use_punc": os.environ.get("FUNASR_USE_PUNC", "true").lower() not in ("0", "false", "no"),
-                "language": "zh",
-            }
+                # 设置默认选项
+                default_options = {
+                    "batch_size_s": 60,
+                    "hotword": "",
+                    # 默认启用 VAD / PUNC，可在外部通过选项或环境变量关闭
+                    "use_vad": os.environ.get("FUNASR_USE_VAD", "false").lower() not in ("0", "false", "no"),
+                    "use_punc": os.environ.get("FUNASR_USE_PUNC", "true").lower() not in ("0", "false", "no"),
+                    "language": "zh",
+                }
 
-            if options:
-                default_options.update(options)
+                if options:
+                    default_options.update(options)
 
-            # 执行语音识别（VAD 处理）
-            if default_options["use_vad"] and self.vad_model:
-                # funasr_onnx.Fsmn_vad 直接调用，返回 segments [[start_ms, end_ms], ...]
-                vad_result = self.vad_model(audio_path)
-                logger.info("VAD处理完成，检测到 %s 个语音段", len(vad_result[0]) if vad_result else 0)
-            elif default_options["use_vad"] and not self.vad_model:
-                logger.warning("use_vad=True 但VAD模型未加载，跳过VAD处理")
+                # 执行语音识别（VAD 处理）
+                if default_options["use_vad"] and self.vad_model:
+                    # funasr_onnx.Fsmn_vad 直接调用，返回 segments [[start_ms, end_ms], ...]
+                    vad_result = self.vad_model(audio_path)
+                    logger.info("VAD处理完成，检测到 %s 个语音段", len(vad_result[0]) if vad_result else 0)
+                elif default_options["use_vad"] and not self.vad_model:
+                    logger.warning("use_vad=True 但VAD模型未加载，跳过VAD处理")
 
-            # 执行ASR识别（根据模型类型使用不同接口）
-            if self.engine == "sensevoice":
-                # SenseVoice: 直接调用，返回 [tagged_text]；
-                # language: auto/zh/en/ja/ko/yue；use_itn 启用数字规范化
-                asr_result = self.asr_model(
-                    [audio_path],
-                    language=default_options.get("language", "auto"),
-                    use_itn=True,
-                )
-            elif hasattr(self.asr_model, "generate"):
-                # PyTorch 模型使用 generate 方法
-                asr_result = self.asr_model.generate(
-                    input=audio_path,
-                    batch_size_s=default_options["batch_size_s"],
-                    hotword=default_options["hotword"],
-                    cache={},
-                )
-            else:
-                # ONNX 模型直接调用（funasr_onnx.Paraformer）
-                asr_result = self.asr_model([audio_path])
-
-            # 提取识别文本（兼容 PyTorch / ONNX / SenseVoice 三种格式）
-            if isinstance(asr_result, list) and len(asr_result) > 0:
-                first_item = asr_result[0]
-                # SenseVoice 格式: ["<|zh|><|NEUTRAL|>...<|woitn|>文本"]
-                if isinstance(first_item, str):
-                    raw_text = first_item
-                # PyTorch 格式: [{"text": "..."}]
-                elif isinstance(first_item, dict) and "text" in first_item:
-                    raw_text = first_item["text"]
-                # ONNX 格式: [{"preds": (text_string, token_list)}]
-                elif isinstance(first_item, dict) and "preds" in first_item:
-                    preds = first_item["preds"]
-                    if isinstance(preds, tuple) and len(preds) > 0:
-                        raw_text = str(preds[0])
-                    else:
-                        raw_text = str(preds)
+                # 执行ASR识别（根据模型类型使用不同接口）
+                if self.engine == "sensevoice":
+                    # SenseVoice: 直接调用，返回 [tagged_text]；
+                    # language: auto/zh/en/ja/ko/yue；use_itn 启用数字规范化
+                    asr_result = self.asr_model(
+                        [audio_path],
+                        language=default_options.get("language", "auto"),
+                        use_itn=True,
+                    )
+                elif hasattr(self.asr_model, "generate"):
+                    # PyTorch 模型使用 generate 方法
+                    asr_result = self.asr_model.generate(
+                        input=audio_path,
+                        batch_size_s=default_options["batch_size_s"],
+                        hotword=default_options["hotword"],
+                        cache={},
+                    )
                 else:
-                    raw_text = str(first_item)
-            else:
-                raw_text = ""
+                    # ONNX 模型直接调用（funasr_onnx.Paraformer）
+                    asr_result = self.asr_model([audio_path])
 
-            # SenseVoice 输出带 <|zh|><|HAPPY|><|Speech|><|woitn|> 标签，剥离
-            if raw_text and raw_text.startswith("<|"):
-                import re
-                raw_text = re.sub(r"<\|[^|]*\|>", "", raw_text).strip()
-
-            logger.info(f"ASR识别完成，原始文本: {raw_text[:100]}...")
-
-            # 使用标点恢复（ONNX 的 CT_Transformer 直接调用）
-            # SenseVoice 的 ITN 输出无标点（woitn 模式），中文场景补充标点模型
-            final_text = raw_text
-            if (
-                self.engine == "sensevoice"
-                and self.punc_model
-                and raw_text.strip()
-                and self._contains_cjk(raw_text)
-            ):
-                try:
-                    punc_result = self.punc_model(raw_text)
-                    if isinstance(punc_result, tuple) and len(punc_result) > 0:
-                        final_text = str(punc_result[0])
+                # 提取识别文本（兼容 PyTorch / ONNX / SenseVoice 三种格式）
+                if isinstance(asr_result, list) and len(asr_result) > 0:
+                    first_item = asr_result[0]
+                    # SenseVoice 格式: ["<|zh|><|NEUTRAL|>...<|woitn|>文本"]
+                    if isinstance(first_item, str):
+                        raw_text = first_item
+                    # PyTorch 格式: [{"text": "..."}]
+                    elif isinstance(first_item, dict) and "text" in first_item:
+                        raw_text = first_item["text"]
+                    # ONNX 格式: [{"preds": (text_string, token_list)}]
+                    elif isinstance(first_item, dict) and "preds" in first_item:
+                        preds = first_item["preds"]
+                        if isinstance(preds, tuple) and len(preds) > 0:
+                            raw_text = str(preds[0])
+                        else:
+                            raw_text = str(preds)
                     else:
-                        final_text = str(punc_result)
-                    logger.info("标点恢复完成")
-                except Exception as e:
-                    logger.warning(f"标点恢复失败，使用原始文本: {str(e)}")
-            elif default_options["use_punc"] and self.punc_model and raw_text.strip():
-                try:
-                    # funasr_onnx.CT_Transformer 返回 (text_with_punc, punc_list)
-                    punc_result = self.punc_model(raw_text)
-                    if isinstance(punc_result, tuple) and len(punc_result) > 0:
-                        final_text = str(punc_result[0])
-                    else:
-                        final_text = str(punc_result)
-                    logger.info("标点恢复完成")
-                except Exception as e:
-                    logger.warning(f"标点恢复失败，使用原始文本: {str(e)}")
+                        raw_text = str(first_item)
+                else:
+                    raw_text = ""
 
-            duration = self._get_audio_duration(audio_path)
-            self.transcription_count += 1
+                # SenseVoice 输出带 <|zh|><|HAPPY|><|Speech|><|woitn|> 标签，剥离
+                if raw_text and raw_text.startswith("<|"):
+                    import re
+                    raw_text = re.sub(r"<\|[^|]*\|>", "", raw_text).strip()
 
-            result = {
-                "success": True,
-                "text": final_text,
-                "raw_text": raw_text,
-                # 注意：静音/噪声音频时 funasr_onnx 返回空列表 []，
-                # 直接取 asr_result[0] 会 IndexError，必须先判空
-                "confidence": (
-                    getattr(asr_result[0], "confidence", 0.0)
-                    if isinstance(asr_result, list) and len(asr_result) > 0
-                    else 0.0
-                ),
-                "duration": duration,
-                "language": "zh-CN",
-                "model_type": self.engine,
-                "models": self.model_names,
-            }
+                logger.info(f"ASR识别完成，原始文本: {raw_text[:100]}...")
 
-            # 生产环境：每10次转录后进行内存清理
-            if self.transcription_count % 10 == 0:
-                self._cleanup_memory()
-                logger.info(f"已完成 {self.transcription_count} 次转录，执行内存清理")
+                # 使用标点恢复（ONNX 的 CT_Transformer 直接调用）
+                # SenseVoice 的 ITN 输出无标点（woitn 模式），中文场景补充标点模型
+                final_text = raw_text
+                if (
+                    self.engine == "sensevoice"
+                    and self.punc_model
+                    and raw_text.strip()
+                    and self._contains_cjk(raw_text)
+                ):
+                    try:
+                        punc_result = self.punc_model(raw_text)
+                        if isinstance(punc_result, tuple) and len(punc_result) > 0:
+                            final_text = str(punc_result[0])
+                        else:
+                            final_text = str(punc_result)
+                        logger.info("标点恢复完成")
+                    except Exception as e:
+                        logger.warning(f"标点恢复失败，使用原始文本: {str(e)}")
+                elif default_options["use_punc"] and self.punc_model and raw_text.strip():
+                    try:
+                        # funasr_onnx.CT_Transformer 返回 (text_with_punc, punc_list)
+                        punc_result = self.punc_model(raw_text)
+                        if isinstance(punc_result, tuple) and len(punc_result) > 0:
+                            final_text = str(punc_result[0])
+                        else:
+                            final_text = str(punc_result)
+                        logger.info("标点恢复完成")
+                    except Exception as e:
+                        logger.warning(f"标点恢复失败，使用原始文本: {str(e)}")
 
-            logger.info(f"转录完成，最终文本: {final_text[:100]}...")
-            return result
+                duration = self._get_audio_duration(audio_path)
+                self.transcription_count += 1
 
-        except Exception as e:
-            error_msg = f"音频转录失败: {str(e)}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
-            return {"success": False, "error": error_msg, "type": "transcription_error"}
+                result = {
+                    "success": True,
+                    "text": final_text,
+                    "raw_text": raw_text,
+                    # 注意：静音/噪声音频时 funasr_onnx 返回空列表 []，
+                    # 直接取 asr_result[0] 会 IndexError，必须先判空
+                    "confidence": (
+                        getattr(asr_result[0], "confidence", 0.0)
+                        if isinstance(asr_result, list) and len(asr_result) > 0
+                        else 0.0
+                    ),
+                    "duration": duration,
+                    "language": "zh-CN",
+                    "model_type": self.engine,
+                    "models": self.model_names,
+                }
+
+                # 生产环境：每10次转录后进行内存清理
+                if self.transcription_count % 10 == 0:
+                    self._cleanup_memory()
+                    logger.info(f"已完成 {self.transcription_count} 次转录，执行内存清理")
+
+                logger.info(f"转录完成，最终文本: {final_text[:100]}...")
+                return result
+
+            except Exception as e:
+                error_msg = f"音频转录失败: {str(e)}"
+                logger.error(error_msg)
+                logger.error(traceback.format_exc())
+                return {"success": False, "error": error_msg, "type": "transcription_error"}
+
+    def transcribe_samples(self, samples, sample_rate: int, options=None):
+        """转录内存中的音频采样（用于流式分段识别），内部落地为临时 WAV 文件后复用 transcribe_audio"""
+        import tempfile
+        import wave
+
+        fd, path = tempfile.mkstemp(prefix="stream_segment_", suffix=".wav")
+        os.close(fd)
+        try:
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(samples.astype("int16").tobytes())
+            return self.transcribe_audio(path, options=options)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def _contains_cjk(self, text: str) -> bool:
         """检查文本是否包含中日韩字符（SenseVoice 英文输出无需中文标点恢复）"""

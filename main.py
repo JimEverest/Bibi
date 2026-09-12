@@ -24,6 +24,45 @@ _last_toggle_time = 0.0
 
 # LLM 润色器在 main() 中根据配置初始化（handler 工厂里引用）
 _LLM_POLISHER = {"instance": None}
+_FLOATING_BUTTON = {"instance": None}
+_TRAY_APP = {"instance": None}
+
+
+def _set_llm_enabled(enabled: bool) -> None:
+    polisher = _LLM_POLISHER["instance"]
+    if polisher is not None:
+        polisher.set_enabled(enabled)
+        logger.info("LLM 润色运行时开关已切换为 %s", bool(enabled))
+
+    tray_app = _TRAY_APP["instance"]
+    if tray_app is not None:
+        tray_app.set_llm_enabled(enabled)
+
+
+def _register_configured_hotkeys(hotkeys, config: dict, worker) -> None:
+    from app.hotkeys import is_hotkey_enabled
+
+    hotkey_cfg = config.get("hotkeys", {})
+    toggle_combo = str(hotkey_cfg.get("toggle", "f2")).strip()
+    if hotkey_cfg.get("toggle_enabled", True) and is_hotkey_enabled(toggle_combo):
+        hotkeys.register(toggle_combo, lambda: _toggle(worker))
+
+    ptt_combo = str(hotkey_cfg.get("push_to_talk", "win+ctrl+alt")).strip()
+    _ptt_owned = {"recording": False}
+
+    def _ptt_start() -> None:
+        if worker.is_running:
+            return
+        _ptt_owned["recording"] = True
+        _toggle(worker)
+
+    def _ptt_stop() -> None:
+        if _ptt_owned["recording"] and worker.is_running:
+            _toggle(worker)
+        _ptt_owned["recording"] = False
+
+    if hotkey_cfg.get("push_to_talk_enabled", True) and is_hotkey_enabled(ptt_combo):
+        hotkeys.register_push_to_talk(ptt_combo, _ptt_start, _ptt_stop)
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,7 +130,7 @@ def main() -> None:
     # 初始化 LLM 润色器（方案5，默认 disabled）
     from app.llm_polish import LLMPolisher
     _LLM_POLISHER["instance"] = LLMPolisher(config.get("llm", {}))
-    if _LLM_POLISHER["instance"].enabled:
+    if _LLM_POLISHER["instance"].is_enabled():
         logger.info(
             "LLM 润色已启用: schema=%s model=%s endpoint=%s",
             _LLM_POLISHER["instance"].schema,
@@ -101,34 +140,126 @@ def main() -> None:
     else:
         logger.info("LLM 润色未启用（llm.enabled=false）")
 
-    # 创建result handler（需要worker引用）
-    worker.on_result = _make_result_handler(output_method, append_newline, worker)
+    floating_button = None
+
+    def _start_recording() -> None:
+        if worker.is_running:
+            return
+        from app.indicator import get_indicator
+
+        if floating_button is None:
+            get_indicator().show_recording()
+        worker.start()
+        if floating_button is not None:
+            floating_button.show_recording()
+
+    def _stop_recording() -> None:
+        if not worker.is_running:
+            return
+        from app.indicator import get_indicator
+
+        worker.stop()
+        if floating_button is None:
+            get_indicator().show_polishing()
+        if floating_button is not None:
+            floating_button.show_processing()
+
+    def _force_stop() -> None:
+        logger.warning("用户触发强制停止")
+        try:
+            worker.force_reset()
+        except Exception as exc:
+            logger.error("强制停止执行失败: %s", exc)
+        if floating_button is not None:
+            try:
+                floating_button.clear_preview()
+                floating_button.show_idle()
+            except Exception as exc:
+                logger.error("强制停止后重置悬浮按钮失败: %s", exc)
+
+    if not args.once:
+        from app.floating_button import FloatingButton
+
+        floating_button = FloatingButton(
+            start_recording=_start_recording,
+            stop_recording=_stop_recording,
+            is_recording=lambda: worker.is_running,
+        )
+    _FLOATING_BUTTON["instance"] = floating_button
+
+    # 创建 result handler（需要 worker 和悬浮按钮引用）
+    worker.on_result = _make_result_handler(
+        output_method,
+        append_newline,
+        worker,
+        floating_button=floating_button,
+    )
     if args.save_dataset:
         worker.on_result = wrap_result_handler(worker.on_result, worker, args.dataset_dir)
-    
+
+    # 流式预览（伪流式）：仅在启用悬浮胶囊、非 --once 单次模式、FunASR 后端且配置开启时接入
+    from app.dictionary import TermReplacer
+    from app.streaming_session import StreamingSession
+    from app.funasr_server import FunASRServer, build_streaming_speech_detector
+
+    replacer = TermReplacer()
+
+    def _stream_transcribe_segment(streaming_fun_server):
+        def _transcribe(samples):
+            result = streaming_fun_server.transcribe_samples(
+                samples,
+                sample_rate=config["audio"]["sample_rate"],
+                options=config.get("asr"),
+            )
+            if not result.get("success"):
+                return {"success": False, "text": ""}
+            result["text"] = replacer.replace(result.get("text", ""))
+            return result
+
+        return _transcribe
+
+    def _stream_polish_tail(prefix_context, tail_text, on_update):
+        polisher = _LLM_POLISHER["instance"]
+        if polisher is None or not polisher.is_enabled():
+            return None
+        return polisher.polish_tail_stream(
+            prefix_context,
+            tail_text,
+            extra_vocab=replacer.vocab_hints(),
+            on_update=on_update,
+        )
+
+    streaming_cfg = config.get("streaming", {})
+    if (
+        not args.once
+        and floating_button is not None
+        and config.get("backend", "funasr").lower() == "funasr"
+        and streaming_cfg.get("enabled", True)
+    ):
+        if streaming_cfg.get("dedicated_model_instance", False):
+            streaming_fun_server = FunASRServer()
+        else:
+            streaming_fun_server = worker.fun_server
+
+        streaming_session = StreamingSession(
+            sample_rate=config["audio"]["sample_rate"],
+            streaming_cfg=streaming_cfg,
+            detect_speech=build_streaming_speech_detector(
+                config.get("vad", {}),
+                config["audio"]["sample_rate"],
+            ),
+            transcribe_segment=_stream_transcribe_segment(streaming_fun_server),
+            polish_tail=_stream_polish_tail,
+            on_preview=lambda committed, tail, state: floating_button.show_preview(
+                committed,
+                tail,
+                state=state,
+            ),
+        )
+        worker.attach_streaming_session(streaming_session)
+
     hotkeys = HotkeyManager()
-
-    toggle_combo = config["hotkeys"].get("toggle", "f2")
-    hotkeys.register(toggle_combo, lambda: _toggle(worker))
-
-    # 按住说话（PTT）：组合键全部按下开始录音，任一键松开停止。
-    # 与 F2 开关模式并存；PTT 启动的录音只由 PTT 松开来停（避免和 F2 互相干扰）
-    ptt_combo = str(config["hotkeys"].get("push_to_talk", "win+ctrl+alt")).strip()
-    _ptt_owned = {"recording": False}
-
-    def _ptt_start() -> None:
-        if worker.is_running:
-            return  # 已在录音（F2 开的或上次 PTT），不重复启动
-        _ptt_owned["recording"] = True
-        _toggle(worker)
-
-    def _ptt_stop() -> None:
-        if _ptt_owned["recording"] and worker.is_running:
-            _toggle(worker)
-        _ptt_owned["recording"] = False
-
-    if ptt_combo and ptt_combo.lower() not in ("none", "off", "disabled"):
-        hotkeys.register_push_to_talk(ptt_combo, _ptt_start, _ptt_stop)
+    _register_configured_hotkeys(hotkeys, config, worker)
 
     # 系统托盘（UI）：不干扰 CLI 用法；--no-tray 可关
     tray_app = None
@@ -143,14 +274,28 @@ def main() -> None:
                 is_recording_fn=lambda: worker.is_running,
                 llm_config_path=config_path,
                 log_dir=log_dir_abs,
+                llm_enabled_callback=_set_llm_enabled,
+                force_stop_callback=_force_stop,
             )
+            _TRAY_APP["instance"] = tray_app
+            if floating_button is not None:
+                floating_button.set_context_menu_callback(tray_app.show_context_menu)
             tray_app.run_detached()
         except Exception as exc:  # noqa: BLE001
             logger.warning("托盘启动失败（继续以纯 CLI 模式运行）: %s", exc)
             tray_app = None
 
     try:
-        logger.info("Speak Keyboard 启动完成，按 %s 开始/停止录音（单击切换，说完再按一次），按 Ctrl+C 退出", toggle_combo)
+        toggle_cfg = config.get("hotkeys", {})
+        toggle_desc = (
+            toggle_cfg.get("toggle", "f2")
+            if toggle_cfg.get("toggle_enabled", True)
+            else "快捷键已关闭"
+        )
+        logger.info(
+            "Speak Keyboard 启动完成，%s；悬浮胶囊可按住或点击切换录音，按 Ctrl+C 退出",
+            toggle_desc,
+        )
         if args.once:
             _toggle(worker)
             input("按 Enter 停止并退出...")
@@ -183,7 +328,12 @@ def main() -> None:
         sys.exit(0)
 
 
-def _make_result_handler(output_method: str, append_newline: bool, worker: TranscriptionWorker):
+def _make_result_handler(
+    output_method: str,
+    append_newline: bool,
+    worker: TranscriptionWorker,
+    floating_button=None,
+):
     from app.dictionary import TermReplacer
     from app.indicator import get_indicator
 
@@ -193,6 +343,9 @@ def _make_result_handler(output_method: str, append_newline: bool, worker: Trans
     def _handle_result(result: TranscriptionResult) -> None:
         if result.error:
             logger.error("转写失败: %s", result.error)
+            if floating_button is not None:
+                floating_button.clear_preview()
+                floating_button.show_idle()
             return
 
         # 术语词典后处理（方案2）：最长优先替换识别错误
@@ -204,8 +357,11 @@ def _make_result_handler(output_method: str, append_newline: bool, worker: Trans
         final_text = corrected
         if _LLM_POLISHER["instance"] is not None:
             polisher = _LLM_POLISHER["instance"]
-            if polisher.enabled:
-                indicator.show_polishing()
+            if polisher.is_enabled():
+                if floating_button is None:
+                    indicator.show_polishing()
+                else:
+                    floating_button.show_processing()
                 # 注入领域词汇提示：术语词典的正确写法，帮助 LLM 纠同音错字
                 polished = polisher.polish(corrected, extra_vocab=replacer.vocab_hints())
                 if polished:
@@ -232,7 +388,11 @@ def _make_result_handler(output_method: str, append_newline: bool, worker: Trans
         )
         # 输出完成后隐藏指示浮窗
         try:
-            indicator.hide()
+            if floating_button is None:
+                indicator.hide()
+            else:
+                floating_button.clear_preview()
+                floating_button.show_idle()
         except Exception:
             pass
 
@@ -254,7 +414,10 @@ def _toggle(worker: TranscriptionWorker) -> None:
     if worker.is_running:
         # 停止录音，提交转录任务
         worker.stop()
-        indicator.show_polishing()
+        if _FLOATING_BUTTON["instance"] is None:
+            indicator.show_polishing()
+        else:
+            _FLOATING_BUTTON["instance"].show_processing()
         stats = worker.transcription_stats
         if stats["pending"] > 0:
             logger.info(
@@ -269,7 +432,10 @@ def _toggle(worker: TranscriptionWorker) -> None:
                 "开始录音（后台还有 %d 个转录任务正在处理）",
                 stats["pending"]
             )
-        indicator.show_recording()
+        if _FLOATING_BUTTON["instance"] is None:
+            indicator.show_recording()
+        else:
+            _FLOATING_BUTTON["instance"].show_recording()
         worker.start()
 
 

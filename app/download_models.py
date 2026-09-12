@@ -8,6 +8,7 @@ import logging
 import sys
 import json
 import threading
+from pathlib import Path
 from app.funasr_config import MODEL_REVISION, get_models_for_download
 from app.logging_config import setup_logging
 
@@ -190,3 +191,28 @@ def get_model_cache_path(model_name, revision):
         )
         logger.info(f"模型下载完成: {model_dir}")
         return model_dir
+
+
+def get_existing_model_cache_path(
+    model_name: str,
+    required_files: tuple[str, ...] = ("model.onnx", "model_quant.onnx"),
+) -> str:
+    """离线本地模型缓存查找（仅本地，绝不触发下载）。
+
+    仅检查现有的 modelscope 本地缓存目录是否存在且包含所需模型文件；
+    若缺失则抛出 FileNotFoundError，调用方需自行处理（例如提示用户手动放置模型）。
+    """
+    home = Path.home()
+    cache_base = home / ".cache" / "modelscope" / "hub" / "models" / "iic"
+    short_name = model_name.split("/")[-1] if "/" in model_name else model_name
+    model_dir = cache_base / short_name
+
+    if not model_dir.exists():
+        raise FileNotFoundError(f"Local model cache not found: {model_name}")
+
+    if not any((model_dir / file_name).exists() for file_name in required_files):
+        raise FileNotFoundError(
+            f"Local model cache is incomplete for {model_name}: need one of {required_files}"
+        )
+
+    return str(model_dir)

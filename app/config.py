@@ -11,9 +11,11 @@ from typing import Any, Dict, Optional
 DEFAULT_CONFIG: Dict[str, Any] = {
     "hotkeys": {
         "toggle": "f2",
+        "toggle_enabled": True,
         # 按住说话（push-to-talk）：组合键全部按下开始录音，任一键松开停止。
         # 设为 "none" 或空可禁用
         "push_to_talk": "win+ctrl+alt",
+        "push_to_talk_enabled": True,
     },
     "audio": {
         "sample_rate": 16000,
@@ -98,6 +100,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "append_newline": False,
     },
     "logging": {"dir": "logs", "level": "INFO"},
+    "streaming": {
+        "enabled": True,
+        "segment_silence_ms": 450,
+        "commit_silence_ms": 1200,
+        "max_uncommitted_ms": 12000,
+        # Onset-smoothing pad kept in the uncommitted buffer after a commit
+        # (not a text-splice overlap): gives the next segment a little
+        # audio-only context so ASR doesn't start "cold".
+        "audio_overlap_ms": 150,
+        "preview_context_chars": 30,
+        "preview_max_chars": 120,
+        "ui_update_debounce_ms": 80,
+        "dedicated_model_instance": False,
+    },
 }
 
 
