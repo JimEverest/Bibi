@@ -184,13 +184,44 @@ class _SettingsWindow:
         self.e_gain.insert(0, str(float(self._cfg.get("audio", {}).get("gain", 12.0))))
         self.e_gain.grid(row=8, column=1, sticky="w", pady=4)
 
+        # 麦克风设备选择（重启生效）
+        from .audio_capture import list_input_devices
+        self._mic_devices = list_input_devices()
+        self._mic_values = ["系统默认输入设备（跟随 Windows 设置）"]
+        self._mic_map = {}  # 显示名 -> 设备编号
+        for d in self._mic_devices:
+            tag = "（系统默认）" if d["default"] else ""
+            display = f"#{d['index']} {d['name']}{tag}"
+            self._mic_values.append(display)
+            self._mic_map[display] = d["index"]
+        cur = self._cfg.get("audio", {}).get("device")
+        ttk.Label(g, text="当前麦克风（重启生效）:").grid(row=9, column=0, sticky="w", pady=4)
+        self.cb_mic = ttk.Combobox(g, width=48, state="readonly", values=self._mic_values)
+        if cur is None:
+            self.cb_mic.set(self._mic_values[0])
+        else:
+            try:
+                cur_idx = int(cur)
+            except (TypeError, ValueError):
+                cur_idx = None
+            display_hit = next((v for v, i in self._mic_map.items() if i == cur_idx), None)
+            if display_hit:
+                self.cb_mic.set(display_hit)
+            else:
+                # 配置里的设备当前未检测到（如 USB 麦克风已拔出）——保留原值并提示
+                missing = f"#{cur}（未检测到，启动时将回退）"
+                self._mic_values.append(missing)
+                self.cb_mic["values"] = self._mic_values
+                self.cb_mic.set(missing)
+        self.cb_mic.grid(row=9, column=1, sticky="w", pady=4)
+
         self.var_save_wav = tk.BooleanVar(value=bool(self._cfg.get("audio", {}).get("save_recordings", False)))
         ttk.Checkbutton(g, text="保存录音 WAV 到 logs/（默认关闭；仅供调试，开启后磁盘会持续增长，重启生效）",
                         variable=self.var_save_wav).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=4)
+            row=10, column=0, columnspan=2, sticky="w", pady=4)
 
         ttk.Button(g, text="一键清理日志与录音文件…", command=self._clean_house).grid(
-            row=10, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            row=11, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         for c in range(2):
             g.columnconfigure(c, weight=1 if c else 0)
@@ -419,6 +450,12 @@ class _SettingsWindow:
             gain = 12.0
         cfg["audio"]["gain"] = gain
         cfg["audio"]["save_recordings"] = bool(self.var_save_wav.get())
+        # 麦克风选择：选了具体设备则存编号，选默认则存 None
+        mic_sel = self.cb_mic.get()
+        if mic_sel in self._mic_map:
+            cfg["audio"]["device"] = self._mic_map[mic_sel]
+        else:
+            cfg["audio"]["device"] = None
 
         try:
             temp = max(0.0, min(1.0, float(self.e_temp.get())))
